@@ -16,7 +16,7 @@ Bridges Android phone to any SIP server as GSM Gateway
 
 A dedicated rooted Android phone with a local SIM card acts as a GSM-to-SIP gateway:
 
-- **Inbound**: Someone calls the SIM's number → the phone answers → the call is bridged to the SIP server, which routes it wherever the dialplan says (an AI agent, a queue, an extension)
+- **Inbound**: Someone calls the SIM's number → the phone places a SIP INVITE to the server while the GSM leg is still ringing → the server's `200 OK` answers the GSM call and the bridge starts, so the caller hears ringing until the agent is on the line
 - **Outbound**: the SIP server sends an INVITE with `X-GSM-From: +<SIM-number>` and `X-GSM-To: +<destination>` → the phone dials the destination over GSM → audio is bridged back to SIP
 - **SMS**: messages arriving on any SIM are forwarded to the server as SIP MESSAGE, and the server can ask the gateway to send one and be told what became of it — see [SMS over SIP](#sms-over-sip)
 
@@ -265,15 +265,24 @@ minimum a server has to provide:
 The Request-URI only addresses the peer and is **never** used as a routing
 fallback — an INVITE missing either header is refused with `488`.
 
-Outbound, the server supplies the same pair through ARI/PJSIP variables; the
-gateway's own reports add `X-SMS-Id` and `X-SMS-Event` alongside the two
-routing headers.
+Outbound, the server supplies the same pair: calls carry it as ARI/PJSIP
+variables (or dialplan `PJSIP_HEADER(add,...)`), SMS as `X-SMS-*` headers.
+The gateway's own SMS reports add `X-SMS-Id` and `X-SMS-Event` alongside the
+two routing headers.
 
 ### Outgoing calls through the gateway
 
 Both routing headers are mandatory. `X-GSM-From` identifies the SIM that must
 place the GSM call, and `X-GSM-To` is the human destination. The Request-URI
 only addresses the SIP account and is not used as a fallback.
+
+The direction rule is the same for calls and SMS: inbound needs a dialplan
+context, outbound offers two equal paths. Inbound calls route and `Dial()`
+there; inbound MESSAGEs need a matching extension that answers `200`
+(an ack sink is enough when the data is consumed over ARI). Outbound calls
+work via dialplan `Dial()` or ARI originate; outbound SMS via dialplan
+`MessageSend()` or ARI `sendMessage`. Both forms are shown below — pick per
+direction, they mix freely.
 
 ```ini
 exten => _X.,1,NoOp(Outbound via GSM gateway: ${EXTEN})
@@ -283,14 +292,33 @@ exten => _X.,1,NoOp(Outbound via GSM gateway: ${EXTEN})
  same => n,Hangup()
 ```
 
-With ARI, pass the same PJSIP variables when originating the channel:
+The ARI equivalent passes the same pair as channel variables when originating:
 
 ```text
 PJSIP_HEADER(add,X-GSM-From)=+4915112345678
 PJSIP_HEADER(add,X-GSM-To)=+4917098765432
 ```
 
+On Asterisk 22.x prefer a pre-dial handler over plain `Set` before `Dial`:
+header inheritance from calling to callee channel got stricter
+(`PJSIP_INHERITABLE_HEADER` exists for a reason), and the handler runs on the
+callee channel itself, so nothing is inherited at all:
+
+```ini
+exten => _X.,1,NoOp(Outbound via GSM gateway: ${EXTEN})
+ same => n,Set(DEST=${EXTEN})
+ same => n,Dial(PJSIP/1001,60,b(add-gw-headers^s^1))
+ same => n,Hangup()
+
+[add-gw-headers]
+exten => s,1,Set(PJSIP_HEADER(add,X-GSM-From)=${SIM_NUMBER})
+ same => n,Set(PJSIP_HEADER(add,X-GSM-To)=${DEST})
+ same => n,Return()
+```
+
 Allow enough time in `Dial()` for GSM setup — 60s is comfortable, 20s is not.
+Dialplan and ARI origination are interchangeable here; the gateway sees the
+same INVITE either way.
 
 ## Call status codes
 
@@ -480,16 +508,20 @@ mistake if assumed otherwise:
   message context — not on a literal `s`.
 
 ```ini
-; pjsip.conf — on the endpoint the gateway registers as
+; pjsip.conf — on the endpoint the gateway registers as.
+; One message context per device — copy the block for each new gateway.
 [1001]
 type=endpoint
 ...
-message_context=sms-from-gsm
+message_context=sms-from-gsm-1001
 ```
 
-The gateway is registered, so it also needs no identify rule for inbound
-MESSAGEs: res_pjsip resolves the endpoint from the authenticated request, and
-MESSAGE is accepted on the same registration the calls use.
+The gateway is registered, but that alone does not route inbound MESSAGEs:
+res_pjsip still matches the endpoint by source address, so the gateway's
+contact address needs an `identify` match. Without one, inbound MESSAGE and
+INVITE are rejected with `No matching endpoint found` even though
+registration succeeds. MESSAGE is accepted on the same registration the
+calls use.
 
 #### Receiving: SMS, reports and gateway announcements
 
@@ -500,31 +532,47 @@ separates an inbound message from a report on something we sent, and
 must not be handled as one.
 
 Note `${MESSAGE(body)}` for the text; the `X-SMS-*` and `X-GW-*` values are SIP
-headers, so they are read with `PJSIP_HEADER(read,...)`.
+headers, so they are read with `PJSIP_HEADER(read,...)` — but only on a real
+PJSIP channel. An inbound MESSAGE runs on a `Message/ast_msg_queue` channel,
+where every `PJSIP_HEADER()` read fails with `This function requires a PJSIP
+channel`. So a server that consumes messages over ARI (`TextMessageReceived`
+carries the headers as variables) keeps the dialplan as an ack sink only:
+match the exten and `Hangup()`, which answers `200` and stops the gateway's
+30s retry. The example below is for a server that handles SMS in the dialplan
+itself (e.g. via AGI); an ARI consumer must not copy the `PJSIP_HEADER` lines.
 
 ```ini
 ; extensions.conf — exten is the registered account user (1001).
-; Log-only: SMS, reports and announcements are consumed over ARI by the API,
-; which is subscribed to every endpoint Asterisk knows. One message context
-; per device — copy the block for each new gateway.
+; Pick ONE of the two forms below, not both.
+;
+; Form A — ack sink with an ARI consumer: the consumer reads SMS, reports and
+; announcements from TextMessageReceived, so the dialplan only acks. Two
+; lines; adding PJSIP_HEADER() here only produces "requires a PJSIP channel"
+; errors. One message context per device — copy the block for each gateway.
 [sms-from-gsm-1001]
-exten => _X.,1,NoOp(MESSAGE ${MESSAGE(from)} -> ${MESSAGE(to)})
- same => n,Set(GW_EVENT=${PJSIP_HEADER(read,X-GW-Event)})
- same => n,GotoIf($["${GW_EVENT}" != ""]?gateway,sms)
-
-; A registration announcement: device identity, audio profile, own numbers.
-; Not an SMS — hand it to whatever tracks devices, or just log it.
- same => n(gateway),NoOp(GW ${GW_EVENT} id=${PJSIP_HEADER(read,X-GW-Id)} profile=${PJSIP_HEADER(read,X-GW-Profile)} numbers=${PJSIP_HEADER(read,X-GW-Numbers)})
+exten => _X.,1,NoOp(Incoming MESSAGE on exten ${EXTEN})
  same => n,Hangup()
 
-; A received SMS. X-SMS-From is the human sender and X-SMS-To is the
-; receiving SIM. MESSAGE(body) is the reassembled text.
- same => n(sms),Set(ID=${PJSIP_HEADER(read,X-SMS-Id)})
- same => n,Set(EVENT=${PJSIP_HEADER(read,X-SMS-Event)})
- same => n,Set(FROM=${PJSIP_HEADER(read,X-SMS-From)})
- same => n,Set(TO=${PJSIP_HEADER(read,X-SMS-To)})
- same => n,NoOp(SMS id=${ID} event=${EVENT} From=${FROM} To=${TO})
- same => n,Hangup()
+; Form B — dialplan-native handler (e.g. via AGI): read and route here.
+; Only for servers with no ARI consumer; never combine with Form A.
+;[sms-from-gsm-1001]
+;exten => _X.,1,NoOp(MESSAGE ${MESSAGE(from)} -> ${MESSAGE(to)})
+; same => n,Set(GW_EVENT=${PJSIP_HEADER(read,X-GW-Event)})
+; same => n,GotoIf($["${GW_EVENT}" != ""]?gateway,sms)
+;
+;; A registration announcement: device identity, audio profile, own numbers.
+;; Not an SMS — hand it to whatever tracks devices, or just log it.
+; same => n(gateway),NoOp(GW ${GW_EVENT} id=${PJSIP_HEADER(read,X-GW-Id)} profile=${PJSIP_HEADER(read,X-GW-Profile)} numbers=${PJSIP_HEADER(read,X-GW-Numbers)})
+; same => n,Hangup()
+;
+;; A received SMS. X-SMS-From is the human sender and X-SMS-To is the
+;; receiving SIM. MESSAGE(body) is the reassembled text.
+; same => n(sms),Set(ID=${PJSIP_HEADER(read,X-SMS-Id)})
+; same => n,Set(EVENT=${PJSIP_HEADER(read,X-SMS-Event)})
+; same => n,Set(FROM=${PJSIP_HEADER(read,X-SMS-From)})
+; same => n,Set(TO=${PJSIP_HEADER(read,X-SMS-To)})
+; same => n,NoOp(SMS id=${ID} event=${EVENT} From=${FROM} To=${TO})
+; same => n,Hangup()
 ```
 
 `submitted` is not the end of the story — a `delivered` or `undelivered`
@@ -544,14 +592,36 @@ sufficient without parsing anything.
 
 #### Sending
 
-Outbound SMS never touches the dialplan: the API sends it over ARI
-(`PUT /endpoints/{tech}/{resource}/sendMessage`) with `?from=` naming the
-endpoint that owns the sending SIM. The Request-URI carries the account name
-and both routing values travel as mandatory headers: `X-SMS-From` selects the
-sending SIM and `X-SMS-To` names the human recipient.
+Two equal paths. Over ARI (`PUT /endpoints/{tech}/{resource}/sendMessage`),
+`?from=` names the endpoint that owns the sending SIM. From the dialplan,
+`MessageSend()` with `MESSAGE_DATA()` headers (`Gosub(sms-out,s,1(recipient,text))`).
+The Request-URI carries the account name and both routing values travel as
+mandatory headers: `X-SMS-From` selects the sending SIM and `X-SMS-To` names
+the human recipient.
 
-`X-SMS-Id` is mandatory. The sender reuses the same stable id for retries so
-the gateway can deduplicate the request and match delivery reports.
+From the dialplan, `MessageSend()` with `MESSAGE_DATA()` headers does the same
+job (`Gosub(sms-out,s,1(recipient,text))`). The gateway ignores the
+Request-URI user and routes purely on the two headers, so the `To:` below is
+ceremonial:
+
+```ini
+[sms-out]
+exten => s,1,NoOp(SMS to ${ARG1})
+ same => n,Set(MESSAGE(body)=${ARG2})
+ same => n,Set(MESSAGE_DATA(X-SMS-From)=${SIM_NUMBER})
+ same => n,Set(MESSAGE_DATA(X-SMS-To)=${ARG1})
+; Stable id for retries, so the gateway dedupes the request and the delivery
+; reports match back to this send. Omit it and the gateway mints one, which
+; arrives only in the reports.
+ same => n,Set(MESSAGE_DATA(X-SMS-Id)=${UNIQUEID})
+ same => n,MessageSend(PJSIP/1001,sip:agent@example.com)
+ same => n,NoOp(send status: ${MESSAGE_SEND_STATUS})
+ same => n,Return()
+```
+
+`MESSAGE_SEND_STATUS` is `SUCCESS` for the `202`, which means the gateway has
+the message queued — not that it reached anyone. `Content-Type` defaults to
+`text/plain`; anything else gets a `415`.
 
 Nothing above is dialplan-only — AMI's `MessageSend` action and ARI's
 `PUT /endpoints/{tech}/{resource}/sendMessage` take the same body and variables.
