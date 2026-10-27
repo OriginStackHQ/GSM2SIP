@@ -61,7 +61,7 @@ object StunClient {
         val oldTimeout = sock.soTimeout
         try {
             network?.bindSocket(sock)
-            sock.soTimeout = 3000
+            sock.soTimeout = 1500   // a live server answers in well under 100 ms
 
             // Build STUN Binding Request (20 bytes header, no attributes)
             val txId = ByteArray(12)

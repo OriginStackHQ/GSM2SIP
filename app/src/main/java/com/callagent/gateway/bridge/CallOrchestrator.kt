@@ -339,6 +339,10 @@ class CallOrchestrator(
      *
      *  Plays both sides mixed; the microphone stays muted, so nothing the room
      *  says reaches either the caller or the agent. */
+
+    /** Whether the active call is on Snoop right now (manual or Call monitor). */
+    val isMonitoring: Boolean get() = activeRtpSession?.isMonitoring == true
+
     fun setMonitorEnabled(on: Boolean) {
         val session = activeRtpSession
         if (session == null) {
@@ -796,6 +800,12 @@ class CallOrchestrator(
             Log.w(TAG, "Bridge torn down during RTP start — stopping orphaned session")
             session.stop()
             if (activeRtpSession === session) activeRtpSession = null
+        } else if (context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+                .getBoolean("call_monitor", false)) {
+            // Settings → Call monitor (upstream 87246af, 1.3.11): every call
+            // starts on Snoop.
+            Log.i(TAG, "Call monitor on — snooping this call")
+            session.setMonitorEnabled(true)
         }
     }
 

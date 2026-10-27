@@ -1287,6 +1287,9 @@ class RtpSession(
         listener?.onRtpStats(if (on) "Agent muted" else "Agent unmuted")
     }
 
+    /** True while the speaker monitor (Snoop) is playing. */
+    val isMonitoring: Boolean get() = monitorTrack != null
+
     /** Turn the speaker monitor on or off mid-call.  Safe to call repeatedly. */
     fun setMonitorEnabled(on: Boolean) {
         if (on) {
@@ -1305,7 +1308,19 @@ class RtpSession(
                             // so a monitor track on USAGE_MEDIA would be sent
                             // to the caller instead of the speaker, which is
                             // the opposite of what monitoring is for.
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            //
+                            // USAGE_ASSISTANCE_SONIFICATION was tried next: that
+                            // is STREAM_SYSTEM, which Android silences during an
+                            // active call, so the monitor played nothing (the
+                            // caller was heard only via the call's own speaker
+                            // path). Nor USAGE_ALARM: the call's audio policy
+                            // mutes alarms on the speaker, leaving only the
+                            // caller, not the agent.  USAGE_VOICE_COMMUNICATION
+                            // is STREAM_VOICE_CALL — the stream that actually
+                            // plays on the speaker while a call is active, and
+                            // the one GsmCallManager.unmutes when monitoring
+                            // turns on.
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
@@ -2062,18 +2077,28 @@ object PcmaCodec {
         7, 7, 7, 7, 7, 7, 7, 7
     )
 
+    /**
+     * G.711 A-law, as in the ITU reference encoder.
+     *
+     * Below 256 the segment is always 0 and the mantissa is the sample's
+     * bits 4..7.  The segment table used to be applied there too, so every
+     * quiet sample (16..255, which is every zero crossing of speech) was
+     * coded as a loud one: 150 came out as 2240.  GSM-to-SIP audio sounded
+     * like a radio at the edge of range while the other direction, which
+     * only decodes, was clean.  Found and fixed by Evgenii Shapovalov.
+     */
     fun encodeSample(pcm: Short): Byte {
-        var sample = pcm.toInt()
-        val sign = (sample shr 8) and 0x80
-        if (sign != 0) sample = -sample
-        if (sample > 32635) sample = 32635
-
-        val exponent = if (sample >= 256) ALAW_ENCODE_TABLE[(sample shr 8) and 0x7F]
-        else ALAW_ENCODE_TABLE[(sample shr 4) and 0x1F].let { if (sample < 16) 0 else it }
-
-        val mantissa = if (exponent > 0) (sample shr (exponent + 3)) and 0x0F else (sample shr 4) and 0x0F
-        val encoded = (sign or (exponent shl 4) or mantissa) xor 0xD5
-        return encoded.toByte()
+        var linear = pcm.toInt()
+        val mask: Int
+        if (linear >= 0) {
+            mask = 0xD5
+        } else {
+            mask = 0x55
+            linear = -linear - 1
+        }
+        val seg = if (linear < 256) 0 else ALAW_ENCODE_TABLE[(linear shr 8) and 0x7F]
+        val mantissa = if (seg == 0) (linear shr 4) and 0x0F else (linear shr (seg + 3)) and 0x0F
+        return (((seg shl 4) or mantissa) xor mask).toByte()
     }
 
     fun decodeSample(alaw: Byte): Short {

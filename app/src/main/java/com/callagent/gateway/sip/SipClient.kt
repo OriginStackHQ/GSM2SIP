@@ -175,8 +175,19 @@ class SipClient(
     }
 
     private fun createSocket() {
+        // Drop both references before open(), not just close them.  open()
+        // throws while the network is down, and this used to leave the client
+        // holding the closed transport and a *terminated* executor with
+        // running still true: every REGISTER after that died with
+        // RejectedExecutionException (which skipped the failure count, so no
+        // full reconnect was ever asked for), and the next incoming call
+        // crashed the app in makeCall — S4 Mini, 2026-10-23.  With both null,
+        // sendTo falls back to a thread and the monitor sees !isOpen and
+        // retries the connection.
         transport?.close()
+        transport = null
         sendExecutor?.shutdownNow()
+        sendExecutor = null
         val t: SipTransport = if (useTls) {
             TlsSipTransport(serverDomain, serverPort, SOCKET_TIMEOUT_MS) { uiLog(it) }
         } else {
@@ -220,7 +231,15 @@ class SipClient(
             }, "SIP-FallbackSend").start()
             return
         }
-        executor.execute { doSend(data, address) }
+        try {
+            executor.execute { doSend(data, address) }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            // Shut down under us (stop() or a reconnect in progress).  Losing
+            // one datagram is recoverable; an exception thrown from here into
+            // a call setup thread is not.
+            uiLog("sendTo: executor shut down — sending on new thread")
+            Thread({ doSend(data, address) }, "SIP-FallbackSend").start()
+        }
     }
 
     private fun doSend(data: String, address: Pair<String, Int>) {

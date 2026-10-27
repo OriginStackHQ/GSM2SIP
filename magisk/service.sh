@@ -75,10 +75,11 @@ wait_for_pm() {
 seed_su_policy() {
     # The uid is assigned when the app is installed, so it cannot be baked in
     # at flash time and can change across a reinstall.  Read it back instead.
+    # dumpsys prints it as userId= up to Android 14 and as appId= on 15.
     SU_UID=$(stat -c %u "/data/user/0/$PKG" 2>/dev/null)
     case "$SU_UID" in
         ''|*[!0-9]*)
-            SU_UID=$(dumpsys package "$PKG" 2>/dev/null | grep -m1 -oE 'userId=[0-9]+' | cut -d= -f2)
+            SU_UID=$(dumpsys package "$PKG" 2>/dev/null | grep -m1 -oE '(userId|appId)=[0-9]+' | cut -d= -f2)
             ;;
     esac
     case "$SU_UID" in

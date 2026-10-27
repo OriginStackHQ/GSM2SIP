@@ -388,46 +388,61 @@ data class DeviceProfile(
             ""
         }
 
+        /** A small sysfs file, or "" if it cannot be read. */
+        private fun readSys(path: String): String = try {
+            java.io.File(path).readText().trim()
+        } catch (_: Throwable) { "" }
+
         /**
          * Auto-detect the device and return the appropriate profile.
          *
-         * Build.BOARD is a build property the ROM vendor picks, and the same
-         * phone reports different values per ROM: a Redmi Note 7 Pro was seen
-         * as board "sm6150" on one LineageOS build and "violet" (the product
-         * codename) on another, silently demoting it to genericQualcomm().
-         * That lost MultiMedia5, the voice_extn call_state announcement and
-         * the mic mute — and logged nothing, because every mixer command
-         * ends in 2>/dev/null.
+         * The key is the chip, never the phone.  Device-level identifiers
+         * (codenames such as "violet", retail model names) are build
+         * properties the ROM vendor picks at will and the same phone reports
+         * different values per ROM; a detection keyed on them would demote
+         * a device to genericQualcomm() and lose MultiMedia5, the voice_extn
+         * call_state announcement and the mic mute — silently, because every
+         * mixer command ends in 2>/dev/null.
          *
-         * Keys, most reliable first:
+         * Chip-family keys, most authoritative first:
+         *   /sys/devices/soc0/machine, /sys/devices/soc0/soc_id
+         *                      - the SoC reports itself, ROM-independent
          *   ro.board.platform  - names the chip, present on every ROM
-         *   Build.SOC_MODEL    - ro.soc.model, Android 12+ only
-         *   Build.BOARD        - kept last, for ROMs that set the others oddly
+         *   Build.SOC_MODEL    - ro.soc.model field, Android 12+ only
+         *   Build.BOARD        - kept last, usually the chip on AOSP, but
+         *                        vendors have been seen putting anything there
          */
         fun detect(): DeviceProfile {
             val hw = Build.HARDWARE.lowercase()
             val board = Build.BOARD.lowercase()
-            val model = Build.MODEL.lowercase()
             val socModel = Build.SOC_MODEL?.lowercase().orEmpty()
             val socMaker = Build.SOC_MANUFACTURER?.lowercase().orEmpty()
             val platform = sysProp("ro.board.platform").lowercase()
+            // Chip identity from soc0: readable without root and ROM-independent
+            // — the SoC reports itself, so no per-device list is needed.
+            val socMachine = readSys("/sys/devices/soc0/machine").lowercase()
+            val socId = readSys("/sys/devices/soc0/soc_id")
             Log.i(
                 TAG,
                 "Detecting device: hw=$hw platform=$platform socModel=$socModel " +
-                    "socMaker=$socMaker board=$board model=${Build.MODEL} device=${Build.DEVICE}"
+                    "socMaker=$socMaker board=$board machine=$socMachine socId=$socId " +
+                    "model=${Build.MODEL} device=${Build.DEVICE}"
             )
 
-            val chip = "$platform $socModel $board"
+            // Every disposition is a chip-family key: matches are made only on
+            // what the SoC (or its Qualcomm identity in soc0) reports about
+            // itself, never on a device codename or retail model name.
+            val chip = "$platform $socModel $board $socMachine"
 
             return when {
-                // Samsung Galaxy S10e Exynos (Exynos 9820)
-                chip.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
-                    exynos9820()
+                // Exynos 9820
+                chip.contains("exynos9820") -> exynos9820()
 
-                // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
-                // e.g. Poco X3 NFC.  The WCD9304 control names some older
-                // Qualcomm parts use do not exist here, so they are not set.
-                chip.contains("sm6150") || chip.contains("sm7150") ->
+                // Qualcomm SM6150/SM7150 with the WCD9375 codec.  soc0 is the
+                // authority: on this line machine reads "SM6150" outright, and
+                // SoC 355 is the SM6150 silicon; 365/366 are the SM7150 parts.
+                chip.contains("sm6150") || chip.contains("sm7150") ||
+                    socId in setOf("355", "365", "366") ->
                     sm6150()
 
                 // Generic Qualcomm — try incall_music, skip codec-specific controls
@@ -764,13 +779,24 @@ data class DeviceProfile(
             // rawCapRMS 1000-5200 against 26-190 on the acoustic path — so it
             // needs no gain at all.  At 4x it clipped (capRMS ~20000 of 32767).
             captureGain = 1,
-            playbackGain = 2,
+            // Unity, ported from pulpoff/gsm2sip 927bfa2 (1.4.14): agent audio
+            // leaves digitally boosted before the limiter, so x2 was pure
+            // boost — peaks at -0.5 dBFS into the limiter, heard as distortion
+            // on the Poco (2026-10-24).  Passed through untouched.
+            playbackGain = 1,
             // 40-55 was measured against a loud recorded announcement; a real
             // caller coming through the speaker only reaches rawCapRMS 19-26,
             // and a gate of 30 discarded nearly all of it (noise=561 vs
             // fwd=481, capRMS=0) so the agent heard nothing at all.  Sits just
             // under the speech floor instead; voiceCallVolPercent below is what
             // buys back the headroom over room noise.
+            //
+            // Upstream 927bfa2 later set this to 0 because its digital
+            // VOICE_DOWNLINK capture is digital silence between words, so a
+            // gate only chops word tails.  Our chain captures acoustically
+            // (preferUnprocessedMic, captureFromTelephonyRx=false), so real
+            // room noise sits between words and the gate still earns its
+            // place here.
             noiseGateThreshold = 12,
             echoGateThreshold = 300,
             doubleTalkRatio = 1.5f,

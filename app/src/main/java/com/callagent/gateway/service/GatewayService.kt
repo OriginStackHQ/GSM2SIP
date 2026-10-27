@@ -178,6 +178,7 @@ class GatewayService : Service() {
                 Log.i(TAG, "Network available")
                 logTransportIfChanged()
                 checkNetworkChanged()
+                scheduleScreenOffRescue()
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "Network lost")
@@ -213,6 +214,45 @@ class GatewayService : Service() {
         cm.registerNetworkCallback(request, cb)
         networkCallback = cb
     }
+
+    private val rescueHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var rescueScheduled = false
+
+    /**
+     * Wake the screen briefly when the gateway has been left with no network
+     * while it is off.  Some phones never search for Wi-Fi with the screen
+     * off: Android 9 leaves that to hardware network offload (PNO), which
+     * older chips such as the S4 Mini's do not have.  It dropped Wi-Fi at
+     * 22:59 and sat offline for 22 minutes, until someone picked it up; every
+     * call in between was missed.  Turning the screen on for a moment is
+     * what makes the framework scan and reconnect.  Repeats every minute
+     * while the network stays gone.
+     *
+     * Ported from pulpoff/gsm2sip 82d54ea (1.4.7).
+     */
+    private fun scheduleScreenOffRescue() {
+        if (rescueScheduled) return
+        rescueScheduled = true
+        rescueHandler.postDelayed({
+            rescueScheduled = false
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val online = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            if (online) { rescueFirst = true; return@postDelayed }
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isInteractive) {
+                broadcastLog("NET: no network with the screen off — waking it to rescan")
+                @Suppress("DEPRECATION")
+                pm.newWakeLock(
+                    PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                    "gateway:rescan"
+                ).acquire(15_000)
+            }
+            scheduleScreenOffRescue()
+        }, if (rescueFirst) 20_000L else 60_000L)
+        rescueFirst = false
+    }
+    private var rescueFirst = true
 
     private fun unregisterNetworkCallback() {
         networkCallback?.let {
@@ -435,10 +475,12 @@ class GatewayService : Service() {
             ACTION_MONITOR -> {
                 // No extra means "toggle", which is what the notification
                 // action sends; the in-call screen passes an explicit value.
+                // Toggle from the call's real state, not a copy kept here:
+                // Call monitor switches Snoop on without going through this.
                 monitorOn = if (intent.hasExtra(EXTRA_MONITOR_ON)) {
                     intent.getBooleanExtra(EXTRA_MONITOR_ON, false)
                 } else {
-                    !monitorOn
+                    !(orchestrator?.isMonitoring ?: monitorOn)
                 }
                 orchestrator?.setMonitorEnabled(monitorOn)
                 updateNotification(NotifState.OK)
