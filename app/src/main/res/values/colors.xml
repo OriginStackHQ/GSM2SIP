@@ -37,6 +37,9 @@
          so they must not read as one status in two shades. -->
     <color name="srtp_badge">#2563EB</color>
 
+    <!-- Call monitor badge: every call plays on the speaker. -->
+    <color name="monitor_badge">#DC2626</color>
+
     <!-- Status bar -->
     <color name="status_bar">#FFFFFF</color>
 </resources>

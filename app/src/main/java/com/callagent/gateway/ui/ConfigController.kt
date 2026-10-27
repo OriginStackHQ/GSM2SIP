@@ -109,6 +109,8 @@ class ConfigController(
             prefs.getBoolean("use_stun", true)
         activity.findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked =
             prefs.getBoolean("translit_ascii", false)
+        activity.findViewById<CheckBox>(R.id.cbCfgCallMonitor).isChecked =
+            prefs.getBoolean("call_monitor", false)
         val cbTls = activity.findViewById<CheckBox>(R.id.cbCfgTls)
         val cbSrtp = activity.findViewById<CheckBox>(R.id.cbCfgSrtp)
         cbTls.isChecked = prefs.getBoolean("sip_tls", false)
@@ -215,6 +217,7 @@ class ConfigController(
         val auto = activity.findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked
         val stun = activity.findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked
         val translit = activity.findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked
+        val callMonitor = activity.findViewById<CheckBox>(R.id.cbCfgCallMonitor).isChecked
         val tls = activity.findViewById<CheckBox>(R.id.cbCfgTls).isChecked
         val srtp = activity.findViewById<CheckBox>(R.id.cbCfgSrtp).isChecked
         val volumeStep = activity.findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress - 3
@@ -240,6 +243,7 @@ class ConfigController(
             .putBoolean("autoconnect", auto)
             .putBoolean("use_stun", stun)
             .putBoolean("translit_ascii", translit)
+            .putBoolean("call_monitor", callMonitor)
             .putBoolean("sip_tls", tls)
             .putBoolean("srtp_enabled", srtp)
             .putString("codec", codec)
@@ -248,7 +252,9 @@ class ConfigController(
         appendLog(
             "Config saved: $user@$server:$port (codec=$codec, stun=${if (stun) "on" else "off"}, " +
                 "tls=${if (tls) "on" else "off"}, srtp=${if (srtp && tls) "on" else "off"}, " +
-                "ascii=${if (translit) "on" else "off"}, agent volume $volumeStep)"
+                "ascii=${if (translit) "on" else "off"}, " +
+                "monitor=${if (callMonitor) "on" else "off"}, " +
+                "agent volume $volumeStep)"
         )
         Toast.makeText(activity, "Saved — reconnecting", Toast.LENGTH_SHORT).show()
         activity.startService(Intent(activity, GatewayService::class.java).apply {

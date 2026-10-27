@@ -32,12 +32,14 @@ class TrafficController(
     private val allButton: Button = activity.findViewById(R.id.btnFilterAll)
     private val incomingButton: Button = activity.findViewById(R.id.btnFilterIncoming)
     private val outgoingButton: Button = activity.findViewById(R.id.btnFilterOutgoing)
+    private val smsButton: Button = activity.findViewById(R.id.btnFilterSms)
     private var filter = "all"
 
     fun bind() {
         allButton.setOnClickListener { setFilter("all") }
         incomingButton.setOnClickListener { setFilter("in") }
         outgoingButton.setOnClickListener { setFilter("out") }
+        smsButton.setOnClickListener { setFilter("sms") }
     }
 
     fun setFilter(value: String) {
@@ -50,6 +52,7 @@ class TrafficController(
             allButton to "all",
             incomingButton to "in",
             outgoingButton to "out",
+            smsButton to "sms",
         )) {
             val active = name == value
             button.backgroundTintList = ColorStateList.valueOf(if (active) selected else normal)
@@ -65,6 +68,7 @@ class TrafficController(
         val visible = when (filter) {
             "in" -> entries.filter { it.direction == "IN" }
             "out" -> entries.filter { it.direction != "IN" }
+            "sms" -> entries.filter { it.type == CallLogStore.TYPE_SMS }
             else -> entries
         }
         list.removeAllViews()

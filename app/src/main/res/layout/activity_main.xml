@@ -46,19 +46,18 @@
                     <TextView
                         android:id="@+id/tvHomeStatusPill"
                         android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="● Offline"
-                        android:textSize="12sp"
-                        android:textStyle="bold"
-                        android:textColor="@color/text_secondary"
+                        android:layout_height="33dp"
+                        android:gravity="center"
+                        android:contentDescription="Offline"
                         android:background="@drawable/input_bg"
-                        android:paddingHorizontal="10dp"
-                        android:paddingVertical="5dp"
+                        android:drawableStart="@drawable/ic_fa_globe"
+                        android:paddingHorizontal="9dp"
+                        android:paddingVertical="0dp"
                         android:layout_marginStart="10dp" />
 
-                    <!-- Height is pinned to the status pill's rather than wrapped:
-                         with no text these still reserve a default line box,
-                         which made them taller than the pill beside them. -->
+                    <!-- Height is pinned rather than wrapped: with no text these
+                         still reserve a default line box, which made them
+                         taller than the 33dp they are meant to share. -->
                     <TextView
                         android:id="@+id/tvHomeTlsBadge"
                         android:layout_width="wrap_content"
@@ -84,6 +83,20 @@
                         android:paddingVertical="0dp"
                         android:layout_marginStart="6dp"
                         android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/tvHomeMonitorBadge"
+                        android:layout_width="wrap_content"
+                        android:layout_height="33dp"
+                        android:gravity="center"
+                        android:contentDescription="Call monitor"
+                        android:background="@drawable/input_bg"
+                        android:drawableStart="@drawable/ic_fa_phone_volume"
+                        android:paddingHorizontal="9dp"
+                        android:paddingVertical="0dp"
+                        android:layout_marginStart="6dp"
+                        android:clickable="true"
+                        android:focusable="true" />
 
                     <View
                         android:layout_width="0dp"
@@ -269,13 +282,21 @@
                         </LinearLayout>
                     </LinearLayout>
 
-                <!-- Filter chips -->
+                <!-- Filter chips.  wrap_content on purpose: the row is only as
+                     wide as its chips, so the weights below can only ever TAKE
+                     space (when four do not fit, LinearLayout shares the
+                     shortfall among the weighted chips), never hand out spare
+                     width — which stretched Incoming/Outgoing with empty sides. -->
                 <LinearLayout
-                    android:layout_width="match_parent"
+                    android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
                     android:paddingTop="16dp">
 
+                    <!-- Four chips on one line, all at their natural width.  If a
+                         narrow screen or a large font leaves too little room,
+                         Incoming and Outgoing (weighted) shrink and cut their
+                         label with …; All and SMS never do.  (Upstream 22d16e7.) -->
                     <Button
                         android:id="@+id/btnFilterAll"
                         android:layout_width="wrap_content"
@@ -285,40 +306,73 @@
                         android:textAllCaps="false"
                         android:textColor="#052E16"
                         android:backgroundTint="#34D399"
-                        android:minWidth="76dp"
+                        android:minWidth="0dp"
                         android:minHeight="0dp"
+                        android:paddingStart="12dp"
+                        android:paddingEnd="12dp"
                         android:insetTop="0dp"
                         android:insetBottom="0dp"
-                        android:layout_marginEnd="8dp" />
+                        android:maxLines="1"
+                        android:ellipsize="end"
+                        android:layout_marginEnd="6dp" />
 
                     <Button
                         android:id="@+id/btnFilterIncoming"
                         android:layout_width="wrap_content"
+                        android:layout_weight="1"
                         android:layout_height="42dp"
                         android:text="Incoming"
                         android:textSize="13sp"
                         android:textAllCaps="false"
                         android:textColor="@color/text_primary"
                         android:backgroundTint="@color/btn_secondary"
-                        android:minWidth="76dp"
+                        android:minWidth="0dp"
                         android:minHeight="0dp"
+                        android:paddingStart="12dp"
+                        android:paddingEnd="12dp"
                         android:insetTop="0dp"
                         android:insetBottom="0dp"
-                        android:layout_marginEnd="8dp" />
+                        android:maxLines="1"
+                        android:ellipsize="end"
+                        android:layout_marginEnd="6dp" />
 
                     <Button
                         android:id="@+id/btnFilterOutgoing"
                         android:layout_width="wrap_content"
+                        android:layout_weight="1"
                         android:layout_height="42dp"
                         android:text="Outgoing"
                         android:textSize="13sp"
                         android:textAllCaps="false"
                         android:textColor="@color/text_primary"
                         android:backgroundTint="@color/btn_secondary"
-                        android:minWidth="76dp"
+                        android:minWidth="0dp"
                         android:minHeight="0dp"
+                        android:paddingStart="12dp"
+                        android:paddingEnd="12dp"
                         android:insetTop="0dp"
-                        android:insetBottom="0dp" />
+                        android:insetBottom="0dp"
+                        android:maxLines="1"
+                        android:ellipsize="end"
+                        android:layout_marginEnd="6dp" />
+
+                    <Button
+                        android:id="@+id/btnFilterSms"
+                        android:layout_width="wrap_content"
+                        android:layout_height="42dp"
+                        android:text="SMS"
+                        android:textSize="13sp"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        android:backgroundTint="@color/btn_secondary"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:paddingStart="12dp"
+                        android:paddingEnd="12dp"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:maxLines="1"
+                        android:ellipsize="end" />
                 </LinearLayout>
 
                 <!-- Recent calls heading stays below the filters; only the list scrolls. -->
@@ -646,6 +700,23 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:text="Rewrites accents before sending: für becomes fuer. Turn on if umlauts arrive mangled. Cyrillic, Hebrew, Arabic and other non-Latin text is never rewritten — it is sent as-is."
+                            android:textSize="12sp"
+                            android:textColor="@color/text_hint"
+                            android:paddingTop="6dp" />
+
+                        <CheckBox
+                            android:id="@+id/cbCfgCallMonitor"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Call monitor"
+                            android:buttonTint="@color/accent"
+                            android:textColor="@color/text_label"
+                            android:layout_marginTop="8dp" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Puts every call on Snoop automatically: caller and agent both play on this phone's speaker. The microphone stays muted. Snoop can still be switched off during a call."
                             android:textSize="12sp"
                             android:textColor="@color/text_hint"
                             android:paddingTop="6dp" />
