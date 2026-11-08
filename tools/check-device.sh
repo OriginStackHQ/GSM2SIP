@@ -7,6 +7,12 @@
 # Qualcomm device is not disqualified by its chip - it is disqualified, or not,
 # by what this prints.
 #
+# Support is a property of the vendor image, not the chip.  The Qualcomm
+# audio HAL family carries this code almost universally, and Google's Tensor
+# phones have it on their AoC audio DSP, but whether the OEM built it in, and
+# whether the audio policy exposes a route to the modem uplink, varies per
+# device and per ROM.
+#
 # The policy check needs no root, so a candidate phone can be vetted before
 # rooting it.  The HAL and mixer checks need root (Magisk, with Superuser
 # access set to "Apps and ADB").
@@ -38,6 +44,17 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
 else
     C_OK=; C_NO=; C_UNK=; C_DIM=; C_OFF=
 fi
+
+POL=/vendor/etc/audio_policy_configuration.xml
+# Does the audio policy contain this (grep -E) pattern?  No root needed.
+pol_has() { sh_ "grep -qE '$1' $POL && echo y" | grep -q y; }
+# Path of a working tinymix, or empty.  The executable bit alone is not
+# enough: an overlay can put a wrong-ABI binary on the path.
+find_tinymix() {
+    for p in /data/local/tmp/tinymix /vendor/bin/tinymix /system/bin/tinymix; do
+        su_ "[ -x $p ] && echo yes" | grep -q yes && { echo "$p"; return; }
+    done
+}
 
 pass=0; fail=0; unknown=0
 ok()  { printf "  %s[ok]%s      %s\n"      "$C_OK"  "$C_OFF" "$1"; pass=$((pass+1)); }
@@ -107,10 +124,14 @@ model=$(sh_ getprop ro.product.model | tr '[:upper:]' '[:lower:]')
 socmodel=$(sh_ getprop ro.soc.model | tr '[:upper:]' '[:lower:]')
 socmaker=$(sh_ getprop ro.soc.manufacturer | tr '[:upper:]' '[:lower:]')
 
+# Google Tensor (Pixel 7 / gs201) runs its audio on the AoC DSP, which has
+# telephony routes the other SoCs lack but no incall_music vocabulary.
+if has "$platform" gs201 || has "$socmodel" gs201 || has "$board" gs201; then
+    soc=tensor
 # ro.hardware is the only reliable signal and is not always a vendor name
 # (Unisoc says "ums", HiSilicon "hi3660").  Check platform too, and fall back
 # to a name guess rather than a whitelist.
-if [ "$hw" = "qcom" ] || has "$hw" qualcomm || has "$platform" "msm" || has "$platform" "sdm"; then
+elif [ "$hw" = "qcom" ] || has "$hw" qualcomm || has "$platform" "msm" || has "$platform" "sdm"; then
     soc=qcom
 elif has "$hw" exynos || has "$hw" samsung || has "$board" universal || has "$platform" exynos; then
     soc=exynos
@@ -125,6 +146,7 @@ case "$soc" in
     qcom)    echo "  Qualcomm - the profile the gateway is tuned for." ;;
     exynos)  echo "  Samsung Exynos - ABOX mixer, no incall_music." ;;
     mtk)     echo "  MediaTek - no tuned DeviceProfile; own HAL and mixer vocabulary." ;;
+    tensor)  echo "  Google Tensor - AoC audio DSP, profile: Tensor GS201." ;;
     unknown) echo "  Unrecognised SoC - generic probes below." ;;
 esac
 echo
@@ -159,6 +181,18 @@ if [ -z "$POL" ] && [ -z "$LEGACY" ]; then
 elif [ -n "$LEGACY" ]; then
     no "only the legacy $LEGACY found - no incall_music concept to check"
     detail "pre-11 policy format; injection is not expressible in it"
+elif [ "$soc" = tensor ]; then
+    # AoC policy: the agent goes out through 'incall playback' into
+    # Telephony Tx, and the caller comes back through 'incall capture'.
+    pol_has 'mixPort name="incall playback"' \
+        && ok "incall playback mixPort declared" \
+        || no "no incall playback mixPort - nothing to inject the agent into"
+    pol_has 'sink="Telephony Tx" sources="incall playback' \
+        && ok "incall playback routed to Telephony Tx" \
+        || no "incall playback is not routed to Telephony Tx"
+    pol_has 'mixPort name="incall capture"' \
+        && ok "incall capture mixPort declared" \
+        || no "no incall capture mixPort - caller can only be heard acoustically"
 else
     # "voice call in" is the downlink capture source on MediaTek; Qualcomm
     # spells it telephony_rx.  flat() rejoins adb's per-word output.
@@ -166,6 +200,18 @@ else
     names=$(sh_ "grep -oiE '$NAMES_RE' $POL | sort -u" | flat)
     lnames=$(printf '%s' "$names" | tr 'A-Z' 'a-z')  # has() is case-sensitive
     detail "$(sh_ "grep -oiE '$NAMES_RE' $POL | sort -u")"
+
+    if [ "$soc" = qcom ]; then
+        # Qualcomm-specific, as upstream checks it: the exact port the HAL
+        # opens, not just any incall_music-looking name.
+        if pol_has incall_music_uplink; then
+            ok "incall_music_uplink mixPort declared"
+            detail "$(sh_ "grep -A4 'mixPort name=\"incall_music_uplink\"' $POL" | grep -i channelmasks | flat)"
+            detail "$(sh_ "grep -i 'sink=\"Telephony Tx\"' $POL | head -1" | flat)"
+        else
+            no "no incall_music_uplink mixPort - nothing to inject the agent into"
+        fi
+    fi
 
     if has "$lnames" incall_music; then
         ok "incall_music mixPort declared"
@@ -209,6 +255,10 @@ if ! have_root; then
         detail "Magisk, set Superuser access = 'Apps and ADB' and run"
         detail "'adb shell su -c id' once to grant the prompt."
     fi
+elif [ "$soc" = tensor ]; then
+    # The AoC HAL is not string-probed: its routes are all in the policy and
+    # the mixer, which sections 1 and 3 cover.
+    echo "            (nothing to check on this family)"
 else
     # Globs, not fixed names: the vendor names the file after its own SoC, so
     # audio.primary.msm8953.so, .sdm660.so, .mt6768.so and .universal9820.so
@@ -251,10 +301,7 @@ if ! have_root; then
         detail "no su on this device at all - this section cannot run here."
     fi
 else
-    TM=""
-    for p in /data/local/tmp/tinymix /vendor/bin/tinymix /system/bin/tinymix; do
-        su_ "[ -x $p ] && echo yes" | grep -q yes && { TM=$p; break; }
-    done
+    TM=$(find_tinymix)
     if [ -z "$TM" ]; then
         unk "tinymix not present - push magisk/tinymix to /data/local/tmp/ (chmod 755)"
     else
@@ -268,6 +315,12 @@ else
         # questions in each vocabulary.  A miss means "not under these names",
         # not "absent": only the count is certain.
         if [ "$soc" = qcom ]; then
+            # Upstream's Qualcomm-specific probes, kept alongside the generic
+            # vocabulary below.
+            n=$(echo "$M" | grep -c 'Incall_Music Audio Mixer')
+            [ "$n" -gt 0 ] && ok "Incall_Music Audio Mixer ($n ports)" || no "Incall_Music Audio Mixer"
+            echo "$M" | grep -q VOC_REC_DL && ok "VOC_REC_DL / VOC_REC_UL" || no "VOC_REC_* capture routing"
+            echo "$M" | grep -q "Voc Rec Config" && ok "Voc Rec Config" || no "Voc Rec Config"
             mixer_probe 'incall_music'              'incall music mixer'
             mixer_probe 'voc_rec|voice.*rec'        'voice record routing'
             mixer_probe 'voice.*(rx|tx).*mute'      'voice device mutes'
@@ -275,6 +328,10 @@ else
             mixer_probe 'abox.*nsrc'                'ABOX NSRC bridge'
             mixer_probe 'spus'                      'ABOX SPUS'
             mixer_probe 'swp|spk'                   'speaker amp controls'
+        elif [ "$soc" = tensor ]; then
+            echo "$M" | grep -q "Incall Playback Stream0" && ok "Incall Playback Stream0/1 - agent audio into the uplink" || no "Incall Playback Stream*"
+            echo "$M" | grep -q "Incall Capture Stream0" && ok "Incall Capture Stream0-3 - caller into the agent" || no "Incall Capture Stream*"
+            echo "$M" | grep -q "Incall Mic Mute" && ok "Incall Mic/Sink Mute - handset out of the call" || no "Incall Mic/Sink Mute"
         else
             mixer_probe 'incall.*music'             'incall music mixer'
             mixer_probe 'voice.*(rec|uplink|downlink)' 'voice rec/uplink mixer'
@@ -297,6 +354,8 @@ detect_profile() {
         echo "exynos9820()"
     elif has "$chip" sm6150 || has "$chip" sm7150; then
         echo "sm6150()"
+    elif has "$platform" gs201 || has "$socmodel" gs201; then
+        echo "tensorGs201()"
     elif has "$hw" qcom || has "$hw" qualcomm || has "$socmaker" qualcomm || [ "$socmaker" = qti ]; then
         echo "genericQualcomm()"
     elif has "$hw" exynos || has "$hw" samsung || has "$socmaker" samsung; then
@@ -312,6 +371,13 @@ echo
 echo "=== Verdict ==="
 if [ "$fail" -eq 0 ] && [ "$unknown" -eq 0 ]; then
     echo "  Fully supported on paper: $pass/$pass checks passed."
+    if [ "$soc" = tensor ]; then
+        echo "  Matches the Tensor GS201 profile (verified on a Pixel 7)."
+    else
+        echo "  A DeviceProfile entry will still be needed - the mixer names are"
+        echo "  generic, but which front-end the playback track lands on is not."
+        echo "  The 'Mixer BEFORE/AFTER' lines logged around each call show it."
+    fi
 elif [ "$fail" -eq 0 ]; then
     echo "  Inconclusive: $pass checks passed, $unknown could not be checked."
     echo "  The unchecked ones are what this verdict turns on."
@@ -319,6 +385,9 @@ elif [ "$soc" = unknown ] && [ "$pass" -le 1 ]; then
     echo "  Not supported: nothing required is present."
 else
     echo "  Partial: $pass present, $fail missing, $unknown unchecked."
+    echo "  Without an output routed to the modem uplink there is no digital"
+    echo "  path to the caller; without an in-call record stream the agent can"
+    echo "  only hear the caller acoustically, through the phone's own microphone."
 fi
 
 case "$soc" in
@@ -342,7 +411,7 @@ esac
 echo
 echo "  DeviceProfile: detect() returns $profile."
 case "$profile" in
-    "sm6150()"|"exynos9820()")
+    "sm6150()"|"exynos9820()"|"tensorGs201()")
         echo "  A tuned entry exists for this board."
         ;;
     "generic()")

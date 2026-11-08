@@ -1,6 +1,12 @@
 ﻿<#
     Decide whether a phone can run the gateway with a fully digital audio path.
 
+    Support is a property of the vendor image, not the chip.  The Qualcomm
+    audio HAL family carries this code almost universally, and Google's Tensor
+    phones have it on their AoC audio DSP, but whether the OEM built it in, and
+    whether the audio policy exposes a route to the modem uplink, varies per
+    device and per ROM.
+
     Independent implementation of the same checks as check-device.sh: same
     questions, same wording, same verdict, so Windows and Linux agree for a
     given phone.  If you change one, change the other - a check that exists in
@@ -140,10 +146,14 @@ $model = (Sh 'getprop ro.product.model').ToLower()
 $socModel = (Sh 'getprop ro.soc.model').ToLower()
 $socMaker = (Sh 'getprop ro.soc.manufacturer').ToLower()
 
+# Google Tensor (Pixel 7 / gs201) runs its audio on the AoC DSP, which has
+# telephony routes the other SoCs lack but no incall_music vocabulary.
+#
 # ro.hardware is the only reliable signal and is not always a vendor name
 # (Unisoc says "ums", HiSilicon "hi3660").  Check platform too, and fall back
 # to a name guess rather than a whitelist.
-$script:soc = if ($script:hw -eq "qcom" -or $script:hw -like "*qualcomm*" -or $platform -like "*msm*" -or $platform -like "*sdm*") { "qcom" }
+$script:soc = if ($platform -like "*gs201*" -or $socModel -like "*gs201*" -or $board -like "*gs201*") { "tensor" }
+             elseif ($script:hw -eq "qcom" -or $script:hw -like "*qualcomm*" -or $platform -like "*msm*" -or $platform -like "*sdm*") { "qcom" }
              elseif ($script:hw -like "*exynos*" -or $script:hw -like "*samsung*" -or $board -like "*universal*" -or $platform -like "*exynos*") { "exynos" }
              elseif ($script:hw -like "mt*" -or $platform -like "mt*" -or $board -like "*mt*" -or $model -like "*mediatek*") { "mtk" }
              else { "unknown" }
@@ -153,6 +163,7 @@ switch ($script:soc) {
     "qcom"   { Write-Host "  Qualcomm - the profile the gateway is tuned for." }
     "exynos" { Write-Host "  Samsung Exynos - ABOX mixer, no incall_music." }
     "mtk"    { Write-Host "  MediaTek - no tuned DeviceProfile; own HAL and mixer vocabulary." }
+    "tensor" { Write-Host "  Google Tensor - AoC audio DSP, profile: Tensor GS201." }
     default  { Write-Host "  Unrecognised SoC - generic probes below." }
 }
 Write-Host ""
@@ -187,6 +198,24 @@ if (-not $POL -and -not $LEGACY) {
 } elseif ($LEGACY) {
     No "only the legacy $LEGACY found - no incall_music concept to check"
     Detail "pre-11 policy format; injection is not expressible in it"
+} elseif ($script:soc -eq "tensor") {
+    # AoC policy: the agent goes out through 'incall playback' into
+    # Telephony Tx, and the caller comes back through 'incall capture'.
+    if ((Sh "grep -qE 'mixPort name=.incall playback.' $POL && echo y") -match 'y') {
+        Ok "incall playback mixPort declared"
+    } else {
+        No "no incall playback mixPort - nothing to inject the agent into"
+    }
+    if ((Sh "grep -qE 'sink=.Telephony Tx. sources=.incall playback' $POL && echo y") -match 'y') {
+        Ok "incall playback routed to Telephony Tx"
+    } else {
+        No "incall playback is not routed to Telephony Tx"
+    }
+    if ((Sh "grep -qE 'mixPort name=.incall capture.' $POL && echo y") -match 'y') {
+        Ok "incall capture mixPort declared"
+    } else {
+        No "no incall capture mixPort - caller can only be heard acoustically"
+    }
 } else {
     # No embedded double quotes: \" ends a PowerShell argument early.
     # "voice call in" is the downlink capture source on MediaTek; Qualcomm
@@ -195,6 +224,18 @@ if (-not $POL -and -not $LEGACY) {
     $namesGrep = "grep -oiE '$NAMES_RE' $POL | sort -u"
     $lnames = (Flat (Sh $namesGrep)).ToLower()
     Detail (ShLines $namesGrep)
+
+    if ($script:soc -eq "qcom") {
+        # Qualcomm-specific, as upstream checks it: the exact port the HAL
+        # opens, not just any incall_music-looking name.
+        if ((Sh "grep -qE 'incall_music_uplink' $POL && echo y") -match 'y') {
+            Ok "incall_music_uplink mixPort declared"
+            Detail (ShLines "grep -A4 'mixPort name=.incall_music_uplink.' $POL | grep -i channelmasks")
+            Detail (ShLines "grep -i 'sink=.Telephony Tx.' $POL | head -1")
+        } else {
+            No "no incall_music_uplink mixPort - nothing to inject the agent into"
+        }
+    }
 
     if ($lnames -match 'incall_music') {
         Ok "incall_music mixPort declared"
@@ -238,6 +279,10 @@ if (-not (Have-Root)) {
         Write-Host "            Magisk, set Superuser access = 'Apps and ADB' and run"
         Write-Host "            'adb shell su -c id' once to grant the prompt."
     }
+} elseif ($script:soc -eq "tensor") {
+    # The AoC HAL is not string-probed: its routes are all in the policy and
+    # the mixer, which sections 1 and 3 cover.
+    Write-Host "            (nothing to check on this family)"
 } else {
     # Globs, not fixed names: the vendor names the file after its own SoC, so
     # audio.primary.msm8953.so, .sdm660.so, .mt6768.so and .universal9820.so
@@ -291,6 +336,21 @@ if (-not (Have-Root)) {
     } else {
         $M = Su $TM
 
+        if ($script:soc -eq "tensor") {
+            # Incall Playback Stream* feeds the uplink; Incall Capture Stream*
+            # carries the caller back.  AoC has no incall_music vocabulary.
+            if ($M -match "Incall Playback Stream0") { Ok "Incall Playback Stream0/1 - agent audio into the uplink" } else { No "Incall Playback Stream*" }
+            if ($M -match "Incall Capture Stream0") { Ok "Incall Capture Stream0-3 - caller into the agent" } else { No "Incall Capture Stream*" }
+            if ($M -match "Incall Mic Mute") { Ok "Incall Mic/Sink Mute - handset out of the call" } else { No "Incall Mic/Sink Mute" }
+        } else {
+        if ($script:soc -eq "qcom") {
+            # Upstream's Qualcomm-specific probes, kept alongside the generic
+            # vocabulary below.
+            $n = @($M -split "`n" | Where-Object { $_ -match 'Incall_Music Audio Mixer' }).Count
+            if ($n -gt 0) { Ok "Incall_Music Audio Mixer ($n ports)" } else { No "Incall_Music Audio Mixer" }
+            if ($M -match 'VOC_REC_DL') { Ok "VOC_REC_DL / VOC_REC_UL" } else { No "VOC_REC_* capture routing" }
+            if ($M -match 'Voc Rec Config') { Ok "Voc Rec Config" } else { No "Voc Rec Config" }
+        }
         # Control names differ per SoC and per codec, so ask the same three
         # questions in each vocabulary.  A miss means "not under these names",
         # not "absent": only the count is certain.
@@ -321,6 +381,7 @@ if (-not (Have-Root)) {
             $n = @($M -split "`n" | Where-Object { $_ -match $p[0] }).Count
             if ($n -gt 0) { Ok "$($p[1]) ($n match)" } else { No $p[1] }
         }
+        }
 
         $mp = Sh "grep -ciE 'voice|incall' /vendor/etc/mixer_paths.xml"
         if ($mp) { Write-Host "            mixer_paths.xml voice/incall lines: $mp" }
@@ -335,6 +396,7 @@ function Get-DetectedProfile {
     $chip = "$platform $socModel $board"
     if ($chip -like "*exynos9820*" -or ($script:hw -like "*exynos*" -and $model -like "*sm-g970*")) { return "exynos9820()" }
     if ($chip -like "*sm6150*" -or $chip -like "*sm7150*") { return "sm6150()" }
+    if ($platform -like "*gs201*" -or $socModel -like "*gs201*") { return "tensorGs201()" }
     if ($script:hw -like "*qcom*" -or $script:hw -like "*qualcomm*" -or $socMaker -like "*qualcomm*" -or $socMaker -eq "qti") { return "genericQualcomm()" }
     if ($script:hw -like "*exynos*" -or $script:hw -like "*samsung*" -or $socMaker -like "*samsung*") { return "genericExynos()" }
     return "generic()"
@@ -346,6 +408,13 @@ Write-Host ""
 Write-Host "=== Verdict ==="
 if ($fail -eq 0 -and $unknown -eq 0) {
     Write-Host "  Fully supported on paper: $pass/$pass checks passed."
+    if ($script:soc -eq "tensor") {
+        Write-Host "  Matches the Tensor GS201 profile (verified on a Pixel 7)."
+    } else {
+        Write-Host "  A DeviceProfile entry will still be needed - the mixer names are"
+        Write-Host "  generic, but which front-end the playback track lands on is not."
+        Write-Host "  The 'Mixer BEFORE/AFTER' lines logged around each call show it."
+    }
 } elseif ($fail -eq 0) {
     Write-Host "  Inconclusive: $pass checks passed, $unknown could not be checked."
     Write-Host "  The unchecked ones are what this verdict turns on."
@@ -353,6 +422,9 @@ if ($fail -eq 0 -and $unknown -eq 0) {
     Write-Host "  Not supported: nothing required is present."
 } else {
     Write-Host "  Partial: $pass present, $fail missing, $unknown unchecked."
+    Write-Host "  Without an output routed to the modem uplink there is no digital"
+    Write-Host "  path to the caller; without an in-call record stream the agent can"
+    Write-Host "  only hear the caller acoustically, through the phone's own microphone."
 }
 
 if ($script:soc -eq "exynos") {
@@ -371,7 +443,7 @@ if ($script:soc -eq "exynos") {
 
 Write-Host ""
 Write-Host "  DeviceProfile: detect() returns $profile."
-if ($profile -eq "sm6150()" -or $profile -eq "exynos9820()") {
+if ($profile -eq "sm6150()" -or $profile -eq "exynos9820()" -or $profile -eq "tensorGs201()") {
     Write-Host "  A tuned entry exists for this board."
 } elseif ($profile -eq "generic()") {
     Write-Host "  That is the no-op profile: it runs no mixer commands, so a usable"

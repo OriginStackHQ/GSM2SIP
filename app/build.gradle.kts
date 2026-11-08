@@ -24,8 +24,8 @@ android {
         // Poco X3 and Galaxy S10e are all unaffected.
         minSdk = 31
         targetSdk = 34
-        versionCode = 425
-        versionName = "1.2.0"
+        versionCode = 457
+        versionName = "1.4.18"
     }
 
     // A release build is signed with the same debug key the debug build uses.

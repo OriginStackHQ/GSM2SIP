@@ -76,6 +76,9 @@ class NetworkInfoController(private val activity: AppCompatActivity) {
             TelephonyManager.NETWORK_TYPE_UMTS -> "3G"
             TelephonyManager.NETWORK_TYPE_EDGE,
             TelephonyManager.NETWORK_TYPE_GPRS -> "2G"
+            // The IMS registration runs over Wi-Fi (via the operator's
+            // ePDG) rather than the cell: Wi-Fi calling.
+            TelephonyManager.NETWORK_TYPE_IWLAN -> "WiFi Calling"
             TelephonyManager.NETWORK_TYPE_UNKNOWN -> "—"
             else -> "?"
         }
@@ -336,6 +339,7 @@ class NetworkInfoController(private val activity: AppCompatActivity) {
         TelephonyManager.NETWORK_TYPE_HSPAP -> "3G"
         TelephonyManager.NETWORK_TYPE_LTE -> "LTE"
         TelephonyManager.NETWORK_TYPE_NR -> "5G NR"
+        TelephonyManager.NETWORK_TYPE_IWLAN -> "IWLAN (Wi-Fi calling)"
         else -> "Unknown"
     }
 }

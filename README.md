@@ -28,6 +28,23 @@ disables Android's audio concurrency restrictions so capture and injection can r
 at the same time. Devices without that path (see [Supported Devices](#supported-devices))
 degrade to shared speaker/mic, which is lossy and prone to echo.
 
+The call audio never goes through the phone's speaker or microphone. On every
+supported phone the agent is put into the call, and the caller read out of it,
+digitally, inside the modem or the audio DSP, while the phone itself stays
+silent. Three chip families do it, each in its own way:
+
+| Chip family | Verified on | Agent → caller | Caller → agent |
+|---|---|---|---|
+| Qualcomm | Poco X3 NFC (SM6150/SM7150), Redmi Note 7 Pro (MSM8953) | `incall_music` into the modem uplink | `VOICE_DOWNLINK`, `VOC_REC_*` |
+| Samsung Exynos | Galaxy S10e (Exynos 9820) | played into the ABOX DSP in place of the mic | tapped off the ABOX downlink |
+| Google Tensor | Pixel 7 (gs201) | `incall playback` → Telephony Tx | the AoC telephony-rx PCM, over root |
+
+The S10e was listed here as impossible for a long time: its audio HAL has no
+telephony path at all. It now works by going past the HAL, straight to the
+DSP — see [The Galaxy S10e](#the-galaxy-s10e-past-the-hal-through-the-abox).
+The Magisk module makes the app a privileged system app, grants what it needs
+on a headless phone, and ships the root tools and the S10e's kernel module.
+
 ## Audio Codec
 
 Selectable in Settings, defaulting to **G.722 only** (wideband, 16 kHz):
@@ -51,8 +68,10 @@ remote actually offered rather than failing a call over a preference.
 | Device | SoC | Agent → caller | Caller → agent | Status |
 |---|---|---|---|---|
 | Redmi Note 7 Pro (`violet`) | Qualcomm SM6150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** |
-| Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital | digital | **fully working** |
-| Samsung Galaxy S10e | Exynos 9820, CS47L93 | no path | no path | not usable |
+| Xiaomi Poco X3 NFC (`surya`) | Qualcomm SM6150/SM7150, WCD9375 | digital, via `incall_music` → `Telephony Tx` | digital, via `VOICE_DOWNLINK` | **fully working** on LineageOS and MIUI 14 |
+| Google Pixel 4a (`sunfish`) | Qualcomm SM7150 | — | — | contributed support; not verified here |
+| Google Pixel 7 (`panther`) | Google Tensor G2 (gs201), AoC audio DSP | digital, via `incall playback` → `Telephony Tx` | digital, via `tinycap` on the AoC telephony-rx PCM (root) | **working** on LineageOS 24 (Android 17), verified on live VoLTE calls |
+| Samsung Galaxy S10e (`beyond0lte`) | Exynos 9820, CS47L93 | digital, played into the ABOX in place of the mic | digital, tapped off the ABOX downlink | **working** on LineageOS 23.2, with `abox_pos.ko` |
 | Nokia 6.1 Plus (`sdm636`) | Qualcomm Snapdragon 636/660 | no path | digital | not usable |
 
 **The Redmi Note 7 Pro is the reference device and works fully**: G.722 wideband
@@ -63,6 +82,30 @@ The Nokia 6.1 Plus is the useful negative case: its audio policy routes
 `Telephony Tx` but declares no `incall_music` mixPort to feed it, so there is
 nothing to inject into. A Qualcomm chip is necessary but not sufficient — the
 policy check in `tools/check-device` settles this without root.
+
+The profile is chosen by the **chip, not the phone's name**: the gateway reads
+`ro.board.platform`, the SoC model and `/sys/devices/soc0`, so any
+SM6150/SM7150 phone gets it whatever its ROM calls it — Mi 9T / Redmi K20,
+Mi Note 10, Redmi Note 7 Pro and the rest of that family (only the Poco X3 NFC
+is verified on live calls).  MIUI reports the board as the codename (`surya`)
+where LineageOS reports the platform, which is why matching by board name alone
+was not enough.  Phones on other chips — the Snapdragon 720G (SM7125) in the
+Redmi Note 9 Pro / Poco M2 Pro, for one — fall back to the generic profile until
+one is tested.
+
+**The Pixel 7 is the first non-Qualcomm phone that works.**  Tensor's SoC is
+Samsung-derived, but its audio runs on Google's own AoC DSP, whose audio policy
+has the telephony routes the Exynos S10e lacks — the ones Call Screen uses.
+Injection goes through the policy like on Qualcomm (`incall playback` →
+`Telephony Tx`, stereo, `incall_music` set before the track exists).  Capture
+does not: every AudioRecord route lands on the AoC's `incall-capture1`
+stream, which reads exact zeros, so the profile reads the caller straight from
+the telephony-rx PCM (`Incall Capture Stream0` = DL, pcm20, 48 kHz) with
+`tinycap` over root and decimates it to 16 kHz.  `Incall Mic Mute` and
+`Incall Sink Mute` take the handset out of the call without cutting the
+injected audio.  On Android 17, privileged apps run in the `priv_app_36`
+SELinux domain, which Magisk 31.1 does not yet let reach its socket - the
+module carries a `sepolicy.rule` for it, without which the app has no root.
 
 ### Choosing a device
 
@@ -107,7 +150,9 @@ What has actually been checked so far:
 | Redmi Note 7 Pro | Snapdragon 660 (MSM8953) | Xiaomi (Android 10) | policy checks pass; unrooted, so untested end to end |
 | Poco X3 NFC | SM6150/SM7150 | Xiaomi (MIUI) | fully working, verified on live calls |
 | Nokia 6.1 Plus | Snapdragon 636/660 | HMD (LineageOS 14) | no `incall_music` mixPort — no injection path |
-| Galaxy S10e | Exynos 9820 | — | no path in either direction |
+| Pixel 4a | SM7150 | Google | recognised by the check, used by a contributor |
+| Pixel 7 | Tensor G2 (gs201) | LineageOS 24 | fully working, verified on live VoLTE calls (both directions digital, SMS both ways) |
+| Galaxy S10e | Exynos 9820 | LineageOS 23.2 | working with `abox_pos.ko`, verified on a live call |
 | POCO C65 | MediaTek Helio G99 (mt6768) | Xiaomi (Android 15) | policy exposes an `incall_music` port; unrooted, so undetermined |
 
 Everything the working profile depends on is generic Qualcomm audio, so other
@@ -148,13 +193,42 @@ stays `CALL_INACTIVE`, so `VOICE_CALL`, `VOICE_DOWNLINK` and the `VOC_REC_*`
 mixers all return silence.  The app announces the call itself
 (`vsid=<hex>;call_state=2`) before opening `AudioRecord`.
 
-The Exynos S10e has no equivalent, and this was confirmed on the hardware
-rather than inferred: `audio_policy_configuration.xml` declares three mixPorts
-(`deep`, `fast`, `primary`) and no telephony device, and
-`audio.primary.universal9820.so` contains no `TELEPHONY_TX`, no `incall_rec`
-usecases and no `voice_extn` `call_state`/`vsid` handling.  There is nothing to
-inject into and nothing to capture from, so neither direction can be digital.
-That is why the gateway moved to a Qualcomm device.
+### The Galaxy S10e: past the HAL, through the ABOX
+
+The S10e's audio HAL has no telephony path at all:
+`audio_policy_configuration.xml` declares three mixPorts (`deep`, `fast`,
+`primary`) and no telephony device, and `audio.primary.universal9820.so` has
+no `TELEPHONY_TX`, no `incall_rec` usecases and no `call_state`/`vsid`
+handling.  Through Android there is nothing to inject into and nothing to
+capture from.
+
+The call itself runs in the ABOX DSP, though, and its routing is all mixer
+controls.  The gateway leaves the HAL out and drives the ABOX directly:
+
+- **Agent → caller:** the agent plays into RDMA8, which is routed onto SIFS2,
+  and the voice processor's two uplink inputs (`ABOX NSRC0`/`NSRC1`) are
+  switched from the codec (`UAIF0`) to SIFS2.  The agent replaces the
+  microphone inside the DSP.  SIFS2 has to be 24-bit, the width the voice
+  processor's resampler expects from the codec; at 16 it buzzes.  And the
+  agent goes in 10 dB down: the voice processor applies the mic gain to it,
+  and at full level it clipped.
+- **Caller → agent:** `ABOX NSRC5` taps SIFS0, where the downlink leaves the
+  voice processor, into WDMA6.  The call volume is applied before that
+  point, so the profile keeps it at 70%.
+- **The phone itself** is silent for the call: both amps muted, the mic
+  inputs turned down.  Neither is in the gateway's path.
+- **Muting the mic through Android must not happen here**: the HAL mutes the
+  whole voice uplink, the agent with it.
+
+Both PCMs run at the call's codec rate (the ABOX converts), streamed by
+`tools/tinypcm` as root.  The catch is that the calliope firmware never
+reports a position for WDMA5-7, nor for RDMA6 during a call, so on a stock
+kernel those PCMs time out after a second.  `tools/abox-pos` is a small
+kernel module that reports the positions in the firmware's place; the
+Magisk module loads it at boot.  It is built against the LineageOS 4.14
+kernel and loads on every build of it: the layout it depends on is checked
+at load, and a kernel that does not match is refused (the app then falls
+back to the HAL, which on this phone means no call audio).
 
 ## Requirements
 
@@ -168,8 +242,25 @@ That is why the gateway moved to a Qualcomm device.
 - **Power**: Always connected to charger
 - **Build host**: JDK 17+ (the minimum Android Gradle plugin 9.0 accepts), plus
   the Android SDK with platform `android-34` and build-tools `36.0.0` (AGP 9.0's
-  default — it is not declared in the build file). Gradle 9.7.1 and AGP 9.0.0
+  default - it is not declared in the build file). Gradle 9.7.1 and AGP 9.0.0
   are resolved by the wrapper, so no local Gradle install is needed.
+
+## What's new in 1.4.18
+
+- **The Galaxy S10e works**, the phone this README used to call impossible: its
+  audio HAL has no telephony path, so the gateway now drives the ABOX DSP
+  directly. Both call directions are digital and the phone's own earpiece,
+  speaker and mics are off for the call. On LineageOS 23.2, with the
+  `abox_pos.ko` the Magisk module loads.
+  See [The Galaxy S10e](#the-galaxy-s10e-past-the-hal-through-the-abox).
+- **Three chip families**: Qualcomm, Samsung Exynos and Google Tensor.
+- **New devices from contributors:**
+  - Google Pixel 7 (Tensor G2), on LineageOS 24 / Android 17 (#27, @flamingspaz).
+- **SMS:** a MESSAGE retransmitted over UDP is sent once, not once per copy,
+  when the server sends no `X-SMS-Id` (#30).
+- **Wi-Fi calling** shows as such in the network badge instead of `?` (#31).
+- **gsm2sipd**, the gateway as a Linux daemon for phones running Mobian, now
+  has a GNOME app: see [linux/](linux/README.md).
 
 ## Download
 

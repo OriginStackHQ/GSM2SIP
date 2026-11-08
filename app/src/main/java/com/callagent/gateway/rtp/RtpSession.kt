@@ -13,6 +13,8 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.callagent.gateway.DeviceProfile
+import com.callagent.gateway.RootCapture
+import com.callagent.gateway.RootPcmRoute
 import com.callagent.gateway.RootShell
 import com.callagent.gateway.gsm.GsmCallManager
 import java.net.DatagramPacket
@@ -53,10 +55,18 @@ class RtpSession(
      *  AudioRecord/AudioTrack before those get released. */
     @Volatile private var workers: List<Thread> = emptyList()
     private var socket: DatagramSocket? = null
-    private var audioRecord: AudioRecord? = null
+    /** Where the caller is read from: an AudioRecord, or a PCM over root. */
+    @Volatile private var capture: CaptureSource? = null
     private var audioTrack: AudioTrack? = null
     /** 1 or 2, per [DeviceProfile.playbackStereo]. */
     private var playbackChannels = 1
+    /** The tinypcm processes carrying the call when the profile routes it over
+     *  raw PCMs ([DeviceProfile.rootPcm]); null on the AudioRecord/AudioTrack
+     *  path, which is every other device. */
+    @Volatile private var pcmCapture: RootPcm? = null
+    @Volatile private var pcmPlayback: RootPcm? = null
+    /** When the next playback frame is due, on the root PCM path. */
+    private var nextPlayNs = 0L
 
     // ── Monitor ("snoop") ────────────────────────────────────────────
     // A second track on the phone's speaker carrying both sides of the call
@@ -172,6 +182,9 @@ class RtpSession(
     private val silentSourceIds = mutableSetOf<Int>()
     @Volatile private var currentSourceId: Int = -1
     private data class SourceConfig(val source: Int, val name: String, val rate: Int)
+
+    /** G.722 carries 16 kHz audio; the G.711 codecs carry 8 kHz. */
+    private val wideband get() = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
     // Silence detection thresholds — only counted during non-echo periods
     // (when decayingPlaybackRms <= echoGateThreshold) to avoid false resets
     // from incall_music echo leaking back through VOICE_CALL capture.
@@ -287,11 +300,17 @@ class RtpSession(
         // it after AudioRecord exists is too late — VOICE_CALL is already bound
         // to a plain capture path and returns silence.
         setHalCallState(2)
+        applyHalCallParams()
 
         // Playback rate matches codec output rate.  G.722 decodes to 16 kHz.
         playbackRate = when (payloadType) {
             RtpPacket.PT_PCMA, RtpPacket.PT_PCMU -> 8000
             else -> 16000  // G.722
+        }
+
+        profile.rootPcm?.let { route ->
+            if (startRootPcm(route)) return true
+            listener?.onRtpStats("Root PCM path failed — falling back to the audio HAL")
         }
 
         // Try telephony capture sources, then mic sources.  buildCaptureConfigs
@@ -302,6 +321,13 @@ class RtpSession(
 
         var record: AudioRecord? = null
         var usedRate = 8000
+
+        // Where the caller is read over root, no AudioRecord is opened up
+        // front: it would only hold a HAL usecase that delivers nothing, to be
+        // torn down as soon as tinycap is up.  Verified on the Pixel 7 — the
+        // telephony-rx PCM carries the caller with no AudioRecord open.  The
+        // search in captureInitAndLoop opens one if root capture fails.
+        if (profile.rootCapture != null) configs.clear()
 
         // No appops assertion and no propagation sleep here.  CallOrchestrator
         // .startRtp() runs the very same grant sequence synchronously
@@ -322,12 +348,7 @@ class RtpSession(
                     continue
                 }
                 val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2) // 40ms (two RTP frames)
-                val rec = AudioRecord(
-                    cfg.source, cfg.rate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
-                )
+                val rec = newAudioRecord(cfg.source, cfg.rate, bufSize)
                 if (profile.captureFromTelephonyRx) {
                     routeCaptureToTelephonyRx(rec)
                 }
@@ -348,7 +369,7 @@ class RtpSession(
         }
 
         if (record != null) {
-            audioRecord = record
+            capture = AudioRecordSource(record, audioSourceName)
             audioSessionId = record.audioSessionId
             captureRate = usedRate
 
@@ -460,8 +481,74 @@ class RtpSession(
         Log.i(TAG, "Audio init: playRate=$playbackRate playUsage=$playbackUsageName " +
             "playBuf=${grantedFrames}f/${grantedMs}ms (asked=$playBufSize min=$minPlayBuf " +
             "lowLatency=${profile.playbackLowLatency}) ch=$playbackChannels " +
-            "capture=${if (audioRecord != null) audioSourceName else "deferred"} profile=${profile.name}")
+            "capture=${if (capture != null) audioSourceName else "deferred"} profile=${profile.name}")
         return true
+    }
+
+    /**
+     * Open the call over raw PCMs: route, start both tinypcm processes, then
+     * switch the call over to them.  See [DeviceProfile.rootPcm].
+     *
+     * Both directions run at the codec's rate; the DSP converts to and from
+     * the call's own.  Undoes its routing and returns false if either process
+     * does not come up, so the caller can fall back to the HAL.
+     */
+    private fun startRootPcm(route: RootPcmRoute): Boolean = synchronized(ROOT_PCM_LOCK) {
+        val setup = DeviceProfile.resolveCmd(route.setupCmd)
+        if (setup.isEmpty()) {
+            listener?.onRtpStats("Root PCM: tinymix not found")
+            return false
+        }
+        listener?.onRtpStats("Root PCM setup: ${RootShell.execForOutput(setup, timeoutMs = 8000).trim()}")
+
+        val rate = playbackRate
+        // 10ms periods; the pipe is mono, the PCMs stereo.
+        val common = "-D ${route.card} -c ${route.channels} -r $rate -b 16 -p ${rate / 100} -m -w 3000"
+        val cap = RootPcm.start(TINYPCM, "cap $common -d ${route.captureDevice} -n 4 -q 10", "cap")
+        val pacer = if (route.pacerDevice >= 0) " -P ${route.pacerDevice}" else ""
+        val play = cap?.let {
+            RootPcm.start(TINYPCM, "play $common -d ${route.playDevice} -n 3 -q 6$pacer", "play",
+                banners = if (pacer.isEmpty()) 1 else 2)
+        }
+        if (cap == null || play == null) {
+            val why = (play ?: cap)?.recentMessages() ?: ""
+            cap?.stop()
+            play?.stop()
+            RootShell.exec(DeviceProfile.resolveCmd(route.teardownCmd), timeoutMs = 8000)
+            listener?.onRtpStats("Root PCM did not start: ${why.ifEmpty { "see logcat RootPcm" }}")
+            return false
+        }
+
+        pcmCapture = cap
+        pcmPlayback = play
+        captureRate = rate
+        playbackChannels = 1
+        nextPlayNs = 0L
+        audioSourceName = "PCM C${route.card}D${route.captureDevice}"
+        playbackUsageName = "PCM C${route.card}D${route.playDevice}"
+        val connect = RootShell.execForOutput(DeviceProfile.resolveCmd(route.connectCmd), timeoutMs = 8000)
+        Log.i(TAG, "Root PCM up at $rate Hz: capture=$audioSourceName playback=$playbackUsageName")
+        listener?.onRtpStats("Root PCM up at $rate Hz, call switched over: ${connect.trim()}")
+        return true
+    }
+
+    /**
+     * Shut the raw PCM path down in the order the DSP needs: the call gets its
+     * own audio back while our streams still run, the streams close, the
+     * routes they needed go.
+     */
+    private fun stopRootPcm(): Unit = synchronized(ROOT_PCM_LOCK) {
+        val route = profile.rootPcm ?: return
+        val cap = pcmCapture
+        val play = pcmPlayback
+        if (cap == null && play == null) return
+        RootShell.exec(DeviceProfile.resolveCmd(route.disconnectCmd), timeoutMs = 8000)
+        pcmCapture = null
+        pcmPlayback = null
+        cap?.stop()
+        play?.stop()
+        RootShell.exec(DeviceProfile.resolveCmd(route.teardownCmd), timeoutMs = 8000)
+        Log.i(TAG, "Root PCM closed")
     }
 
     /**
@@ -486,8 +573,29 @@ class RtpSession(
             return
         }
 
-        // Fast path: AudioRecord was already initialized in initAudio (warm boot)
-        if (audioRecord != null) {
+        pcmCapture?.let { rootCaptureLoop(it); return }
+
+        val defaultRemoteInet = InetAddress.getByName(remoteAddr)
+
+        // Root PCM capture first where the profile asks for it — see
+        // DeviceProfile.rootCapture.  tinycap can exit mid-call (the HAL
+        // re-opens the in-call usecases on hold/resume or a RAT handover), and
+        // on the devices that need this the AudioRecord sources below are the
+        // ones that read silence, so a fresh tinycap gets a few tries before
+        // they get a turn.
+        profile.rootCapture?.let { cfg ->
+            for (attempt in 1..ROOT_CAPTURE_ATTEMPTS) {
+                if (!running.get()) return
+                if (!startRootCapture(cfg)) break   // could not launch: retrying will not help
+                if (captureLoop() || !running.get()) return
+                Log.w(TAG, "Root PCM capture ended (attempt $attempt/$ROOT_CAPTURE_ATTEMPTS) — restarting")
+                sendSilencePackets(500, defaultRemoteInet)
+            }
+            Log.w(TAG, "Root PCM capture unavailable — trying the AudioRecord sources")
+        }
+
+        // Fast path: the source was already opened in initAudio (warm boot)
+        if (capture != null) {
             if (captureLoop() || !running.get()) return
             // Source produced silence for 3s — fall through to try alternatives
             Log.w(TAG, "Primary source $audioSourceName silent, searching for working source (skip: $silentSourceIds)")
@@ -498,8 +606,6 @@ class RtpSession(
         // as silent.  This handles both cold-boot AudioRecord unavailability
         // AND sources that initialize but deliver no audio (e.g., VOICE_CALL
         // on Exynos 9820 where the HAL doesn't route voice data to capture).
-        val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
-        val defaultRemoteInet = InetAddress.getByName(remoteAddr)
         val maxFallbacks = 5  // Maximum silent-source fallback cycles
 
         for (fallback in 0 until maxFallbacks) {
@@ -512,12 +618,12 @@ class RtpSession(
                 break
             }
 
-            if (fallback > 0 || audioRecord == null) {
+            if (fallback > 0 || capture == null) {
                 Log.w(TAG, "Trying capture sources (fallback=$fallback): ${configs.joinToString { it.name }} (silent: $silentSourceIds)")
             }
 
             // Try to initialize AudioRecord with one of the remaining sources
-            val maxAttempts = if (fallback == 0 && audioRecord == null) 15 else 3
+            val maxAttempts = if (fallback == 0 && capture == null) 15 else 3
             var sourceFound = false
 
             for (attempt in 1..maxAttempts) {
@@ -534,18 +640,13 @@ class RtpSession(
                         )
                         if (minBuf <= 0) continue
                         val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2)
-                        val rec = AudioRecord(
-                            cfg.source, cfg.rate,
-                            AudioFormat.CHANNEL_IN_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            bufSize
-                        )
+                        val rec = newAudioRecord(cfg.source, cfg.rate, bufSize)
                         if (profile.captureFromTelephonyRx) {
                         routeCaptureToTelephonyRx(rec)
                     }
                     if (rec.state == AudioRecord.STATE_INITIALIZED) {
                             if (!running.get()) { rec.release(); return }
-                            audioRecord = rec
+                            capture = AudioRecordSource(rec, cfg.name)
                             audioSessionId = rec.audioSessionId
                             captureRate = cfg.rate
                             audioSourceName = cfg.name
@@ -589,6 +690,61 @@ class RtpSession(
         while (running.get()) {
             sendSilencePackets(5000, defaultRemoteInet)
         }
+    }
+
+    /**
+     * Start reading the caller from [cfg] over root.
+     *
+     * False — with nothing changed — if the mixer command it needs cannot
+     * be resolved, or tinycap could not be launched or produced nothing.
+     */
+    private fun startRootCapture(cfg: RootCapture): Boolean {
+        val setup = DeviceProfile.resolveCmd(cfg.setupCmd)
+        if (cfg.setupCmd.isNotEmpty() && setup.isEmpty()) {
+            // Without the routing command the PCM opens un-routed and reads
+            // zeros for the whole call — not something to find out slowly.
+            Log.w(TAG, "Root PCM capture: tinymix NOT FOUND, cannot route the PCM")
+            return false
+        }
+        val rate = if (wideband) 16000 else 8000
+        val cap = try {
+            RootPcmCapture(cfg.card, cfg.device, cfg.rate, rate, setup, DeviceProfile.resolveCmd(cfg.restoreCmd))
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Root PCM capture: ${e.message}")
+            return false
+        }
+        if (!cap.start()) return false
+        capture = cap
+        captureRate = rate
+        audioSourceName = cap.name
+        currentSourceId = -1
+        // stop() may have run while su was spawning: it saw no capture to
+        // close, so this one has to go the same way itself.
+        if (!running.get()) {
+            releaseCaptureSource()
+            return false
+        }
+        return true
+    }
+
+    /** Drop the current capture source: unblock its reader now, give the
+     *  device back off this thread. */
+    private fun releaseCaptureSource() {
+        val src = capture ?: return
+        capture = null
+        src.close()
+        Thread({ src.release() }, "capture-release").start()
+    }
+
+    /** Leave the current source, saying why, and have the caller pick another.
+     *  [blacklist] keeps an AudioRecord source from being tried again this
+     *  call; a root PCM has no source id and is never blacklisted. */
+    private fun giveUpSource(msg: String, blacklist: Boolean = true): Boolean {
+        Log.w(TAG, msg)
+        listener?.onRtpStats(msg)
+        if (blacklist && currentSourceId >= 0) silentSourceIds.add(currentSourceId)
+        releaseCaptureSource()
+        return false
     }
 
     /** Build the prioritized list of capture source configs, excluding
@@ -702,6 +858,12 @@ class RtpSession(
         // and so never became running.  A caller waiting on the stopped
         // callback would otherwise wait out its own timeout.
         val wasRunning = running.getAndSet(false)
+        // Put the in-call HAL parameters back here as well as in
+        // GsmCallManager.restoreAudio(): that one is skipped when the
+        // InCallService is already gone, which would leave the handset's mic and
+        // earpiece muted for the next ordinary call.
+        restoreHalCallParams()
+
         if (!wasRunning) {
             notifyRtpStopped()
             return
@@ -719,9 +881,12 @@ class RtpSession(
 
         val ws = workers
         workers = emptyList()
-        val rec = audioRecord
+        val cap = capture
         val trk = audioTrack
-        audioRecord = null
+        // Unblock the capture thread's read now — for tinycap that means
+        // killing it — so the joins below do not wait on it.
+        capture = null
+        cap?.close()
         audioTrack = null
         socket = null
         jitterBuffer.clear()
@@ -735,10 +900,8 @@ class RtpSession(
                 catch (e: InterruptedException) { Log.w(TAG, "Interrupted joining ${it.name}: ${e.message}") }
                 if (it.isAlive) Log.w(TAG, "${it.name} still running after ${JOIN_TIMEOUT_MS}ms")
             }
-            rec?.let {
-                try { it.stop() } catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed: ${e.message}") }
-                try { it.release() } catch (e: Exception) { Log.w(TAG, "AudioRecord release failed: ${e.message}") }
-            }
+            try { stopRootPcm() } catch (e: Exception) { Log.w(TAG, "Root PCM stop: ${e.message}") }
+            cap?.let { try { it.release() } catch (_: Exception) {} }
             trk?.let {
                 try { it.stop() } catch (e: Exception) { Log.w(TAG, "AudioTrack stop failed: ${e.message}") }
                 try { it.release() } catch (e: Exception) { Log.w(TAG, "AudioTrack release failed: ${e.message}") }
@@ -760,9 +923,11 @@ class RtpSession(
     // Audio parameters from device profile
     private val profile get() = GsmCallManager.profile
     private val captureGain get() = profile.captureGain
-    /** The profile's digital gain with the manual trim from settings applied. */
+    /** The profile's digital gain with its dB trim and the manual trim from
+     *  settings applied. */
     private val playbackGain: Double
-        get() = profile.playbackGain * GsmCallManager.agentGainFactor
+        get() = profile.playbackGain * Math.pow(10.0, profile.playbackGainDb / 20) *
+            GsmCallManager.agentGainFactor
 
     // Double-talk detection: VOICE_CALL captures uplink+downlink from
     // the modem DSP.  The uplink contains the SIP agent's voice (injected
@@ -823,9 +988,8 @@ class RtpSession(
      * be replaced with a fallback source.
      */
     private fun captureLoop(): Boolean {
-        val record = audioRecord ?: return false
-
-        record.startRecording()
+        val src = capture ?: return false
+        if (!src.start()) return giveUpSource("Source $audioSourceName would not start — trying fallback")
 
         // Re-assert in-call capture routing now that the stream exists — see
         // DeviceProfile.mixerCaptureCmd.  Off the capture thread, because the
@@ -838,8 +1002,7 @@ class RtpSession(
             }, "mixer-capture").start()
         }
 
-        Log.i(TAG, "Capture routedFrom=${record.routedDevice?.type}")
-        Log.i(TAG, "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId gain=${captureGain}x profile=${profile.name} state=${record.recordingState}")
+        Log.i(TAG, "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId gain=${captureGain}x profile=${profile.name}")
         // Also report via RTP stats so it appears in the app log viewer
         listener?.onRtpStats("Capture: source=$audioSourceName rate=$captureRate gain=${captureGain}x profile=${profile.name}")
 
@@ -866,8 +1029,13 @@ class RtpSession(
 
         while (running.get()) {
             try {
-                val read = record.read(pcmBuf, 0, pcmBuf.size)
-                if (read <= 0) continue
+                val read = src.read(pcmBuf)
+                if (read < 0) {
+                    // The source is gone: tinycap exited, or a dead IAudioRecord.
+                    if (!running.get()) break
+                    return giveUpSource("Source $audioSourceName ended — trying fallback", blacklist = false)
+                }
+                if (read == 0) continue
                 framesCaptured++
 
                 // Checked once, on a window early in the call: switching
@@ -884,14 +1052,7 @@ class RtpSession(
                             val pct = framesCaptured * 100 / expected
                             val msg = "Source $audioSourceName too slow: $framesCaptured/$expected " +
                                 "frames ($pct%) in ${elapsed}ms — trying fallback"
-                            Log.w(TAG, msg)
-                            listener?.onRtpStats(msg)
-                            silentSourceIds.add(currentSourceId)
-                            try { record.stop() }
-                            catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed on source switch: ${e.message}") }
-                            record.release()
-                            audioRecord = null
-                            return false
+                            return giveUpSource(msg)
                         }
                     }
                 }
@@ -940,15 +1101,7 @@ class RtpSession(
                                 }
                                 silenceFrameCount = 0
                             } else {
-                                val msg = "Source $audioSourceName SILENT ($silenceFrameCount non-echo frames) — trying fallback"
-                                Log.w(TAG, msg)
-                                listener?.onRtpStats(msg)
-                                silentSourceIds.add(currentSourceId)
-                                try { record.stop() }
-                                catch (e: Exception) { Log.w(TAG, "AudioRecord stop failed on source switch: ${e.message}") }
-                                record.release()
-                                audioRecord = null
-                                return false  // Signal: try another source
+                                return giveUpSource("Source $audioSourceName SILENT ($silenceFrameCount non-echo frames) — trying fallback")
                             }
                         }
                     } else {
@@ -960,106 +1113,148 @@ class RtpSession(
                 // During echo periods: don't update counter (can't distinguish
                 // caller audio from incall_music echo)
 
-                // Double-talk-aware gating: replaces the old hard echo gate
-                // that made the bridge half-duplex (caller completely silenced
-                // during agent speech).  Now uses adaptive echo level estimation
-                // to detect when the caller is speaking over the agent.
-                //
-                // VOICE_CALL captures uplink+downlink.  incall_music injects
-                // the agent's voice digitally into the uplink with a consistent
-                // gain ratio.  We track that ratio and detect when capture energy
-                // exceeds the expected echo — that excess is the caller's voice.
-                // Update decaying echo reference: tracks playback level
-                // through brief inter-word gaps to suppress echo tails.
-                if (currentPlaybackActive && playbackRms > 0) {
-                    decayingPlaybackRms = playbackRms
-                } else if (decayingPlaybackRms > 0) {
-                    decayingPlaybackRms = (decayingPlaybackRms * 0.80).toInt()
-                }
-
-                val shouldForward: Boolean
-                if (profile.playbackLeaksIntoCapture &&
-                    decayingPlaybackRms > echoGateThreshold) {
-                    // Agent is speaking (or echo tail still decaying) —
-                    // check for double-talk (barge-in).
-                    val expectedEcho = (echoGainRatio * decayingPlaybackRms).toInt()
-                        .coerceAtLeast(noiseGateThreshold)
-                    if (rawCaptureRms > (expectedEcho * DOUBLE_TALK_RATIO).toInt()) {
-                        // Double-talk: caller speaking over agent — forward.
-                        // Some echo leaks through but caller is audible.
-                        shouldForward = true
-                        doubleTalkFrames++
-                    } else {
-                        // Echo-only: agent speaking, caller silent — send silence.
-                        // Update echo gain estimate from confirmed echo frames.
-                        if (currentPlaybackActive && playbackRms > 500) {
-                            val r = rawCaptureRms.toFloat() / playbackRms
-                            echoGainRatio = echoGainRatio * 0.95f + r * 0.05f
-                            echoGainSamples++
-                        }
-                        shouldForward = false
-                        echoGatedFrames++
-                    }
-                } else if (rawCaptureRms < noiseGateThreshold) {
-                    // Noise gate: only modem digital noise, no caller speech.
-                    shouldForward = false
-                    noiseGatedFrames++
-                } else {
-                    // Caller speaking, agent silent — forward normally.
-                    shouldForward = true
-                }
-
-                if (shouldForward) {
-                    // Apply gain boost
-                    if (captureGain > 1) {
-                        for (i in 0 until read / 2) {
-                            val lo = pcmBuf[i * 2].toInt() and 0xFF
-                            val hi = pcmBuf[i * 2 + 1].toInt()
-                            val sample = ((hi shl 8) or lo) * captureGain
-                            val clamped = sample.coerceIn(-32768, 32767)
-                            pcmBuf[i * 2] = (clamped and 0xFF).toByte()
-                            pcmBuf[i * 2 + 1] = ((clamped shr 8) and 0xFF).toByte()
-                        }
-                    }
-                    captureRms = pcmRms(pcmBuf)
-                    forwardedFrames++
-                } else {
-                    java.util.Arrays.fill(pcmBuf, 0, read, 0.toByte())
-                    captureRms = 0
-                }
-
-                // Encode based on codec and capture sample rate.
-                // G.722 expects 16 kHz PCM; if capture is 8 kHz, upsample first.
-                val encoded = when (payloadType) {
-                    RtpPacket.PT_G722 -> {
-                        val pcm16k = if (captureRate == 8000) upsample8kTo16k(pcmBuf) else pcmBuf
-                        g722Encoder.encode(pcm16k)
-                    }
-                    RtpPacket.PT_PCMA -> {
-                        if (captureRate == 8000) PcmaCodec.encode8k(pcmBuf)
-                        else PcmaCodec.encode(pcmBuf)
-                    }
-                    else -> {
-                        val pcm16k = if (captureRate == 8000) upsample8kTo16k(pcmBuf) else pcmBuf
-                        g722Encoder.encode(pcm16k)
-                    }
-                }
-
-                val destAddr = latchedAddr ?: defaultRemoteInet
-                val destPort = if (latchedAddr != null) latchedPort else remotePort
-
-                val packet = RtpPacket(payloadType, txSequence, txTimestamp, txSsrc, encoded)
-                val data = packet.encode()
-                sendRtp(data, destAddr, destPort)
-
-                txSequence = (txSequence + 1) and 0xFFFF
-                txPacketCount++
-                txTimestamp += 160 // 20ms at 8000Hz RTP clock
+                gateEncodeAndSend(pcmBuf, read, defaultRemoteInet)
             } catch (e: Exception) {
                 if (running.get()) Log.e(TAG, "Capture error: ${e.message}")
             }
         }
         return true  // Normal exit (call ended)
+    }
+
+    /**
+     * Capture loop for the raw PCM path: 20ms mono frames off tinypcm's stdout.
+     *
+     * None of the AudioRecord machinery applies.  The source is the call
+     * itself, fixed by the profile, so there is nothing to fall back to and no
+     * silence to judge it by; and tinypcm drops rather than blocks, so a frame
+     * that arrives is a frame on time.
+     */
+    private fun rootCaptureLoop(pcm: RootPcm) {
+        val defaultRemoteInet = InetAddress.getByName(remoteAddr)
+        val pcmBuf = ByteArray(captureRate / 50 * 2)
+        val input = java.io.DataInputStream(pcm.input)
+        listener?.onRtpStats("Capture: source=$audioSourceName rate=$captureRate gain=${captureGain}x profile=${profile.name}")
+        while (running.get()) {
+            try {
+                input.readFully(pcmBuf)
+            } catch (e: java.io.IOException) {
+                if (running.get()) {
+                    Log.e(TAG, "Root PCM capture ended: ${e.message} (${pcm.recentMessages()})")
+                    listener?.onRtpStats("Root PCM capture ended: ${pcm.recentMessages()}")
+                }
+                break
+            }
+            rawCaptureRms = pcmRms(pcmBuf)
+            if (monitorTrack != null) lastCallerFrame = pcmBuf.copyOf()
+            try {
+                gateEncodeAndSend(pcmBuf, pcmBuf.size, defaultRemoteInet)
+            } catch (e: Exception) {
+                if (running.get()) Log.e(TAG, "Capture error: ${e.message}")
+            }
+        }
+        // Keep the far end's NAT pinhole and RTP timer alive for the rest of
+        // the call even with capture gone; the agent can still be heard.
+        while (running.get()) sendSilencePackets(5000, defaultRemoteInet)
+    }
+
+    /** Gate, gain, encode and send one captured 20ms frame — the part of the
+     *  capture path that does not care where the frame came from. */
+    private fun gateEncodeAndSend(pcmBuf: ByteArray, read: Int, defaultRemoteInet: InetAddress) {
+        // Double-talk-aware gating: replaces the old hard echo gate
+        // that made the bridge half-duplex (caller completely silenced
+        // during agent speech).  Now uses adaptive echo level estimation
+        // to detect when the caller is speaking over the agent.
+        //
+        // VOICE_CALL captures uplink+downlink.  incall_music injects
+        // the agent's voice digitally into the uplink with a consistent
+        // gain ratio.  We track that ratio and detect when capture energy
+        // exceeds the expected echo — that excess is the caller's voice.
+        // Update decaying echo reference: tracks playback level
+        // through brief inter-word gaps to suppress echo tails.
+        if (currentPlaybackActive && playbackRms > 0) {
+            decayingPlaybackRms = playbackRms
+        } else if (decayingPlaybackRms > 0) {
+            decayingPlaybackRms = (decayingPlaybackRms * 0.80).toInt()
+        }
+
+        val shouldForward: Boolean
+        if (profile.playbackLeaksIntoCapture &&
+            decayingPlaybackRms > echoGateThreshold) {
+            // Agent is speaking (or echo tail still decaying) —
+            // check for double-talk (barge-in).
+            val expectedEcho = (echoGainRatio * decayingPlaybackRms).toInt()
+                .coerceAtLeast(noiseGateThreshold)
+            if (rawCaptureRms > (expectedEcho * DOUBLE_TALK_RATIO).toInt()) {
+                // Double-talk: caller speaking over agent — forward.
+                // Some echo leaks through but caller is audible.
+                shouldForward = true
+                doubleTalkFrames++
+            } else {
+                // Echo-only: agent speaking, caller silent — send silence.
+                // Update echo gain estimate from confirmed echo frames.
+                if (currentPlaybackActive && playbackRms > 500) {
+                    val r = rawCaptureRms.toFloat() / playbackRms
+                    echoGainRatio = echoGainRatio * 0.95f + r * 0.05f
+                    echoGainSamples++
+                }
+                shouldForward = false
+                echoGatedFrames++
+            }
+        } else if (rawCaptureRms < noiseGateThreshold) {
+            // Noise gate: only modem digital noise, no caller speech.
+            shouldForward = false
+            noiseGatedFrames++
+        } else {
+            // Caller speaking, agent silent — forward normally.
+            shouldForward = true
+        }
+
+        if (shouldForward) {
+            // Apply gain boost
+            if (captureGain > 1) {
+                for (i in 0 until read / 2) {
+                    val lo = pcmBuf[i * 2].toInt() and 0xFF
+                    val hi = pcmBuf[i * 2 + 1].toInt()
+                    val sample = ((hi shl 8) or lo) * captureGain
+                    val clamped = sample.coerceIn(-32768, 32767)
+                    pcmBuf[i * 2] = (clamped and 0xFF).toByte()
+                    pcmBuf[i * 2 + 1] = ((clamped shr 8) and 0xFF).toByte()
+                }
+            }
+            captureRms = pcmRms(pcmBuf)
+            forwardedFrames++
+        } else {
+            java.util.Arrays.fill(pcmBuf, 0, read, 0.toByte())
+            captureRms = 0
+        }
+
+        // Encode based on codec and capture sample rate.
+        // G.722 expects 16 kHz PCM; if capture is 8 kHz, upsample first.
+        val encoded = when (payloadType) {
+            RtpPacket.PT_G722 -> {
+                val pcm16k = if (captureRate == 8000) upsample8kTo16k(pcmBuf) else pcmBuf
+                g722Encoder.encode(pcm16k)
+            }
+            RtpPacket.PT_PCMA -> {
+                if (captureRate == 8000) PcmaCodec.encode8k(pcmBuf)
+                else PcmaCodec.encode(pcmBuf)
+            }
+            else -> {
+                val pcm16k = if (captureRate == 8000) upsample8kTo16k(pcmBuf) else pcmBuf
+                g722Encoder.encode(pcm16k)
+            }
+        }
+
+        val destAddr = latchedAddr ?: defaultRemoteInet
+        val destPort = if (latchedAddr != null) latchedPort else remotePort
+
+        val packet = RtpPacket(payloadType, txSequence, txTimestamp, txSsrc, encoded)
+        val data = packet.encode()
+        sendRtp(data, destAddr, destPort)
+
+        txSequence = (txSequence + 1) and 0xFFFF
+        txPacketCount++
+        txTimestamp += 160 // 20ms at 8000Hz RTP clock
     }
 
     // ── Receive: RTP recv → jitter buffer ───────────────
@@ -1242,6 +1437,78 @@ class RtpSession(
     private var monitorBuf: ByteArray = ByteArray(0)
 
     /**
+     * Write one playback frame without allowing a wedged Qualcomm incall
+     * output to block the RTP thread for seconds.  Blocking AudioTrack.write()
+     * was observed to stall for 6-10 seconds when the voice route changed;
+     * that left the old incall_music_uplink alive and made the next call
+     * intermittently one-way.
+     */
+    private fun writePlaybackFrame(track: AudioTrack, data: ByteArray) {
+        var offset = 0
+        val deadline = System.nanoTime() + 30_000_000L
+        while (offset < data.size && running.get()) {
+            val written = track.write(
+                data, offset, data.size - offset, AudioTrack.WRITE_NON_BLOCKING
+            )
+            if (written > 0) {
+                offset += written
+                continue
+            }
+            if (written < 0) {
+                Log.w(TAG, "AudioTrack nonblocking write failed: $written")
+                return
+            }
+            if (System.nanoTime() >= deadline) {
+                Log.w(TAG, "AudioTrack nonblocking write timed out (${data.size - offset} bytes left)")
+                return
+            }
+            try {
+                Thread.sleep(1)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
+    }
+
+    /** One playback frame to wherever this session plays: the AudioTrack, or
+     *  the root PCM pipe. */
+    private fun writePlaybackOut(track: AudioTrack?, data: ByteArray) {
+        val root = pcmPlayback
+        if (root != null) writeRootPlaybackFrame(root, data)
+        else if (track != null) writePlaybackFrame(track, data)
+    }
+
+    /**
+     * Write one frame to tinypcm, then wait until the next is due.
+     *
+     * An AudioTrack paces this loop by blocking when its buffer is full; the
+     * pipe does not, and tinypcm on the other end never pushes back — it
+     * drops what it has no room for so that it can never stall the DMA.  So
+     * the pacing is done here instead, one frame per 20ms of the monotonic
+     * clock.  Behind by more than three frames (a stall, a GC), start the
+     * schedule afresh rather than racing to catch up.
+     */
+    private fun writeRootPlaybackFrame(pcm: RootPcm, data: ByteArray) {
+        try {
+            pcm.output.write(data)
+            pcm.output.flush()
+        } catch (e: java.io.IOException) {
+            if (running.get()) {
+                Log.e(TAG, "Root PCM playback ended: ${e.message} (${pcm.recentMessages()})")
+                listener?.onRtpStats("Root PCM playback ended: ${pcm.recentMessages()}")
+                pcmPlayback = null
+            }
+            return
+        }
+        val now = System.nanoTime()
+        if (nextPlayNs == 0L || now - nextPlayNs > 60_000_000L) nextPlayNs = now
+        nextPlayNs += 20_000_000L
+        val waitNs = nextPlayNs - System.nanoTime()
+        if (waitNs > 0) Thread.sleep(waitNs / 1_000_000, (waitNs % 1_000_000).toInt())
+    }
+
+    /**
      * Duplicate each 16-bit mono sample into both channels.
      *
      * Needed only so the track can match the HAL's stereo-only
@@ -1278,6 +1545,69 @@ class RtpSession(
         } catch (e: Exception) {
             Log.w(TAG, "setHalCallState($state) failed: ${e.message}")
         }
+    }
+
+    /**
+     * Set the profile's in-call HAL parameters.  See DeviceProfile.halCallParams
+     * for why a HAL without a mixer needs them.
+     */
+    private fun applyHalCallParams() {
+        if (profile.halCallParams.isEmpty()) return
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            for (p in profile.halCallParams) am.setParameters(p)
+            Log.i(TAG, "HAL call params set: ${profile.halCallParams}")
+        } catch (e: Exception) {
+            Log.w(TAG, "applyHalCallParams failed: ${e.message}")
+        }
+    }
+
+    /** Undo [applyHalCallParams]; a no-op for profiles that set none. */
+    private fun restoreHalCallParams() {
+        if (profile.halCallParamsRestore.isEmpty()) return
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            for (p in profile.halCallParamsRestore) am.setParameters(p)
+        } catch (e: Exception) {
+            Log.w(TAG, "restoreHalCallParams failed: ${e.message}")
+        }
+    }
+
+    /**
+     * AudioRecord for [source].  Android 8.1 refuses the call sources
+     * (VOICE_UPLINK/DOWNLINK/CALL) through the public constructor (8.0 shares
+     * the framework code but is untested): the
+     * AudioAttributes it builds drops a capture preset it does not know, and the
+     * constructor then throws "Invalid audio source -1".  The hidden
+     * (attributes, format, size, session) constructor takes the preset as given,
+     * so build the attributes by hand and force the source into them.
+     * Only reached when the public constructor throws.
+     */
+    private fun newAudioRecord(source: Int, rate: Int, bufSize: Int): AudioRecord {
+        try {
+            return AudioRecord(
+                source, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize
+            )
+        } catch (e: IllegalArgumentException) {
+            Log.i(TAG, "AudioRecord source=$source rejected by the public constructor " +
+                "(${e.message}); trying the hidden one")
+        }
+        val attrs = AudioAttributes.Builder().build()
+        AudioAttributes::class.java.getDeclaredField("mSource").apply {
+            isAccessible = true
+            setInt(attrs, source)
+        }
+        val fmt = AudioFormat.Builder()
+            .setSampleRate(rate)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+            .build()
+        val ctor = AudioRecord::class.java.getDeclaredConstructor(
+            AudioAttributes::class.java, AudioFormat::class.java,
+            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
+        )
+        ctor.isAccessible = true
+        return ctor.newInstance(attrs, fmt, bufSize, 0)
     }
 
     /** Mute or unmute the agent towards the caller. */
@@ -1398,32 +1728,35 @@ class RtpSession(
     }
 
     private fun playbackLoop() {
-        val track = audioTrack ?: return
+        val track = audioTrack
+        if (track == null && pcmPlayback == null) return
 
-        // No prefill — the silence-frame loop below feeds the AudioTrack
-        // continuously, preventing underruns.  Removing the old 20ms prefill
-        // saves that much initial latency.
-        track.play()
-        Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true) " +
-            "routedTo=${track.routedDevice?.type}")
+        if (track != null) {
+            // No prefill — the silence-frame loop below feeds the AudioTrack
+            // continuously, preventing underruns.  Removing the old 20ms prefill
+            // saves that much initial latency.
+            track.play()
+            Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true) " +
+                "routedTo=${track.routedDevice?.type}")
 
-        // Set incall_music_enabled=true AFTER AudioTrack.play(): some Qualcomm
-        // HALs start the incall-music usecase only once there is an active
-        // STREAM_MUSIC output.
-        //
-        // Skipped where the profile already set it before the track existed.
-        // Toggling it again here reconfigures the voice path and tears down the
-        // in-call record session the HAL has just started — measured on SM6150:
-        // VOICE_CALL delivered real audio (rawRMS=208) until this second toggle
-        // fired 8ms later, after which capture went to zero.
-        if (!profile.incallMusicBeforeTrack) {
-            enableIncallMusic()
+            // Set incall_music_enabled=true AFTER AudioTrack.play(): the Qualcomm
+            // HAL on MSM8930 starts the incall-music usecase only once there is an
+            // active STREAM_MUSIC output.
+            //
+            // Skipped where the profile already set it before the track existed.
+            // Toggling it again here reconfigures the voice path and tears down the
+            // in-call record session the HAL has just started — measured on SM6150:
+            // VOICE_CALL delivered real audio (rawRMS=208) until this second toggle
+            // fired 8ms later, after which capture went to zero.
+            if (!profile.incallMusicBeforeTrack) {
+                enableIncallMusic()
+            }
+            // Set mixer controls via root — also handles Voice Tx Mute=0.
+            // No separate ensureVoiceTxOpen() call here: the mixer thread below
+            // already issues that command, and waiting for su -c was blocking
+            // the playback thread for ~100ms.
+            enableIncallMusicViaMixer()
         }
-        // Set mixer controls via root — also handles Voice Tx Mute=0.
-        // No separate ensureVoiceTxOpen() call here: the mixer thread below
-        // already issues that command, and waiting for su -c was blocking
-        // the playback thread for ~100ms.
-        enableIncallMusicViaMixer()
 
         // Silence frame for when jitter buffer is empty — prevents underruns
         // that cause BUFFER TIMEOUT and AudioTrack disable/restart cycles.
@@ -1449,7 +1782,7 @@ class RtpSession(
                 val encoded = jitterBuffer.poll(JITTER_POLL_MS, TimeUnit.MILLISECONDS)
                 if (encoded == null) {
                     // Write silence to keep AudioTrack fed and prevent underruns.
-                    track.write(silenceFrame, 0, silenceFrame.size)
+                    writePlaybackOut(track, silenceFrame)
                     underruns++
                     playbackRms = 0
                     currentPlaybackActive = false
@@ -1515,7 +1848,7 @@ class RtpSession(
                 playbackRms = if (playbackGain > 1) pcmRms(pcm) else rawRms
                 feedMonitor(pcm)
                 val out = if (playbackChannels == 2) monoToStereo(pcm) else pcm
-                track.write(out, 0, out.size)
+                writePlaybackOut(track, out)
                 playbackFrames++
             } catch (e: InterruptedException) {
                 break
@@ -1934,7 +2267,7 @@ class RtpSession(
                         if (running.get()) {
                             val probeCmd = buildString {
                                 append("echo '=== ALSA capture PCM probe (all cards) ==='; ")
-                                append("if [ ! -x /data/local/tmp/tinycap ]; then ")
+                                append("if [ ! -x ${RootPcmCapture.TINYCAP} ]; then ")
                                 append("  echo 'tinycap not found'; ")
                                 append("else ")
                                 // Iterate all capture PCMs across all cards
@@ -1954,7 +2287,7 @@ class RtpSession(
                                 append("    bits=16; echo \"\$fmt\" | grep -q S32 && bits=32; ")
                                 append("    echo \"  hw: fmt=\$fmt ch=\$ch rate=\$rate bits=\$bits\"; ")
                                 // Capture 1 second of raw audio with actual params
-                                append("    timeout 2 /data/local/tmp/tinycap /data/local/tmp/probe_\${cardnum}_\${devnum}.raw ")
+                                append("    timeout 2 ${RootPcmCapture.TINYCAP} /data/local/tmp/probe_\${cardnum}_\${devnum}.raw ")
                                 append("-D \$cardnum -d \$devnum -c \${ch:-2} -r \${rate:-48000} -b \${bits} -p 480 -n 4 2>&1 | head -2; ")
                                 append("    f=/data/local/tmp/probe_\${cardnum}_\${devnum}.raw; ")
                                 append("    if [ -f \"\$f\" ] && [ -s \"\$f\" ]; then ")
@@ -2043,6 +2376,15 @@ class RtpSession(
          *  anyway.  A capture read is one 20ms frame and the playback poll is
          *  18ms, so a healthy loop is gone well inside this. */
         private const val JOIN_TIMEOUT_MS = 400L
+        /** Installed by the Magisk module, next to tinymix. */
+        private const val TINYPCM = "/data/local/tmp/tinypcm"
+        /** One raw PCM path per device: a session being replaced must finish
+         *  its teardown before the next one routes. */
+        private val ROOT_PCM_LOCK = Any()
+
+        /** Launches of tinycap per call before the AudioRecord sources get
+         *  a turn — see [captureInitAndLoop]. */
+        private const val ROOT_CAPTURE_ATTEMPTS = 3
 
         /** Jitter buffer ceiling, in 20ms frames (240ms). */
         private const val JITTER_CAPACITY = 12
