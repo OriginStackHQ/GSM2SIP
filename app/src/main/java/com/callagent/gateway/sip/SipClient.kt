@@ -523,6 +523,19 @@ class SipClient(
         // Send 100 Trying
         sendTo(SipBuilder.trying100(msg), address)
 
+        // Delayed offer is refused on the initial INVITE: with no audio line
+        // there is no codec to answer, and an offer of neither PCMA nor G.722
+        // is a codec this build cannot speak.  Refuse explicitly rather than
+        // accept a call that could only carry silence.
+        if (!msg.hasAudioOffer || msg.sdpPreferredPayloadType == -1) {
+            uiLog(
+                if (!msg.hasAudioOffer) "Incoming INVITE without SDP — 488"
+                else "Incoming INVITE offers no PCMA/G.722 — 488"
+            )
+            sendTo(SipBuilder.reject(msg, 488, "Not Acceptable Here"), address)
+            return
+        }
+
         val call = SipCall(callId, SipCall.Direction.INBOUND, this)
         call.originalInvite = msg
         call.callerNumber = msg.callerNumber
@@ -577,6 +590,7 @@ class SipClient(
         val call = SipCall(callId, SipCall.Direction.OUTBOUND, this)
         call.extraHeaders = extraHeaders
         call.localRtpPort = localRtpPort
+        call.localOfferedPayloadTypes = SipBuilder.offerVoicePayloadTypes
         call.fromHeader = "<sip:$username@$serverDomain>;tag=${call.localTag}"
         call.toHeader = "<sip:$targetExtension@$serverDomain>"
 

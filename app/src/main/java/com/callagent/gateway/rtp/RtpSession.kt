@@ -47,6 +47,9 @@ class RtpSession(
     private val remotePort: Int,
     private val payloadType: Int = RtpPacket.PT_PCMA
 ) {
+    /** Last unknown payload type logged, so a misnegotiated call logs once. */
+    private var unknownTxPayloadTypeLogged = -1
+    private var unknownRxPayloadTypeLogged = -1
     private val running = AtomicBoolean(false)
     /** Ensures the stop callback is delivered once, including for a session
      *  that failed during startup and never reached the running state. */
@@ -1240,8 +1243,13 @@ class RtpSession(
                 else PcmaCodec.encode(pcmBuf)
             }
             else -> {
-                val pcm16k = if (captureRate == 8000) upsample8kTo16k(pcmBuf) else pcmBuf
-                g722Encoder.encode(pcm16k)
+                // Never encode an unknown PT as G.722: the peer did not agree
+                // to that codec, so the frame would be unreadable.  Drop it.
+                if (unknownTxPayloadTypeLogged != payloadType) {
+                    unknownTxPayloadTypeLogged = payloadType
+                    Log.e(TAG, "No encoder for negotiated PT $payloadType — dropping TX")
+                }
+                return
             }
         }
 
@@ -1303,7 +1311,9 @@ class RtpSession(
                 if (rxPacketCount == 1L) {
                     Log.i(TAG, "First RX: pt=${rtp.payloadType} len=${rtp.payload.size}")
                 }
-                if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
+                // Only the negotiated voice PT belongs in the jitter buffer.
+                // PT 101 (DTMF) and any other payload type are dropped.
+                if (rtp.payloadType == payloadType) {
                     if (!jitterBuffer.offer(rtp.payload)) {
                         jitterBuffer.poll() // drop oldest
                         jitterBuffer.offer(rtp.payload)
@@ -1806,7 +1816,17 @@ class RtpSession(
                         if (playbackRate == 8000) PcmaCodec.decode8k(encoded)
                         else PcmaCodec.decode(encoded)
                     }
-                    else -> g722Decoder.decodeToBytes(encoded)
+                    else -> {
+                        // Unreachable: receiveLoop queues only the negotiated
+                        // PT, and answer negotiation allows only 8 or 9.  Drop
+                        // rather than silently decode it as G.722.
+                        if (unknownRxPayloadTypeLogged != payloadType) {
+                            unknownRxPayloadTypeLogged = payloadType
+                            Log.e(TAG, "No decoder for negotiated PT $payloadType — dropping RX")
+                        }
+                        writePlaybackOut(track, silenceFrame)
+                        continue
+                    }
                 }
 
                 // Fade-in after silence: prevents modem DSP AGC spike that

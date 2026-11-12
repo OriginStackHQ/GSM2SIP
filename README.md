@@ -52,16 +52,22 @@ Selectable in Settings, defaulting to **G.722 only** (wideband, 16 kHz):
 | Setting | Offered in SDP |
 |---|---|
 | G.722 only *(default)* | `9 101` |
-| G.722 preferred, G.711 allowed | `9 8 0 101` |
-| G.711 only | `8 0 101` |
+| G.722 preferred, G.711 allowed | `9 8 101` |
+| G.711 only | `8 101` |
 
 Payload `101` is `telephone-event` (DTMF), offered in every mode. The app does
-not consume in-band DTMF; it is advertised so the offer is complete.
+not consume in-band DTMF; it is advertised so the offer is complete, and RFC
+2833/4733 events are neither sent nor relayed.
 
 The default is G.722 alone because offering G.711 alongside it means servers
 routinely pick G.711 and every call ends up narrowband regardless of what both
-ends support.  Whatever is configured, the app still answers with a codec the
-remote actually offered rather than failing a call over a preference.
+ends support.
+
+An answer carries exactly one voice payload type, chosen from the offer: G.722
+and "both" accept `9` then `8`, while G.711-only accepts `8` then `9`.  A
+PCMA-only offer in G.722 mode is therefore answered with PCMA (`8 101`) rather
+than failing the call.  A peer that offers neither 8 nor 9 gets `488 Not
+Acceptable Here`.  PCMU (payload 0) is not implemented and is never offered.
 
 ## Supported Devices
 
@@ -103,9 +109,11 @@ stream, which reads exact zeros, so the profile reads the caller straight from
 the telephony-rx PCM (`Incall Capture Stream0` = DL, pcm20, 48 kHz) with
 `tinycap` over root and decimates it to 16 kHz.  `Incall Mic Mute` and
 `Incall Sink Mute` take the handset out of the call without cutting the
-injected audio.  On Android 17, privileged apps run in the `priv_app_36`
-SELinux domain, which Magisk 31.1 does not yet let reach its socket - the
-module carries a `sepolicy.rule` for it, without which the app has no root.
+injected audio.  Privileged apps run in a version-dependent SELinux domain
+(`priv_app` up to Android 16, `priv_app_36` on Android 17), which Magisk 31.1
+does not yet let reach its socket - the module carries a `sepolicy.rule`
+covering both, and its `post-fs-data.sh` applies the rule live on devices
+without preinit storage, without which the app has no root.
 
 ### Choosing a device
 
@@ -313,21 +321,23 @@ Only the Magisk module needs to be installed — it includes the APK and handles
 3. **Set as default phone app**: Settings → Apps → Default apps → Phone app → GSM2SIP
 4. **Configure SIP**: open Settings in the app (the gear, top right) and enter
    your SIP server address, port, username and password
-5. **Own Number**: Enter the SIM's own number in strict international E.164
-   format, e.g. `+4915112345678`. It is used as the `X-GSM-To` value for
-   incoming calls and as the source identity for SMS. The gateway rejects a
-   call when no valid own number is available.
+5. **Own Number**: Enter each SIM's own number in strict international E.164
+   format, e.g. `+4915112345678`. One field per SIM slot. The
+   platform-published number is used when available; this field is the fallback
+   for carriers that publish none. It is the inbound destination (`X-GSM-To`
+   and the Request-URI user) and the source identity for SMS.
 6. **Start**: the gateway registers and begins bridging calls; the header pill
    shows **Online** once registration succeeds (tap it to retry)
 
 ### What the SIP leg carries
 
-- **Request-URI** — SIP peer/account addressing only.
+- **Request-URI** — `sip:<gateway number>@<server domain>`, carrying the same
+  strict `+E.164` value as `X-GSM-To`.
 - **X-GSM-From** — the human caller, normalized to strict `+E.164`.
-- **X-GSM-To** — the receiving SIM's number, normalized to strict `+E.164`.
+- **X-GSM-To** — the receiving SIM's number, strict `+E.164`.
 
-The server must route from the mandatory `X-GSM-*` headers. The Request-URI is
-not a routing fallback.
+The server can route from either the R-URI user or the mandatory `X-GSM-*`
+headers; both name the same number.
 
 ## Quick start with callagent.pro
 
@@ -348,13 +358,15 @@ minimum a server has to provide:
 
 | Requirement | Value |
 |---|---|
-| Registration | digest auth; the gateway registers as a single contact |
+| Registration | digest auth; the gateway registers as a single contact (`expires=120`, refreshed every 60 s) |
 | Codec | `G.722` (payload `9`); `101` telephone-event is always offered |
-| Inbound call routing | `X-GSM-From` and `X-GSM-To`, both strict `+E.164` |
+| Inbound call routing | `X-GSM-From` and `X-GSM-To`, both strict `+E.164`; R-URI user equals `X-GSM-To` |
 | SMS routing | `X-SMS-From` and `X-SMS-To`, both strict `+E.164` |
 
-The Request-URI only addresses the peer and is **never** used as a routing
-fallback — an INVITE missing either header is refused with `488`.
+The Request-URI user is the gateway number and matches `X-GSM-To`; the server
+may route from either. An initial INVITE with no `m=audio` is refused with `488`
+(no delayed-offer support), and an INVITE offering neither PCMA nor G.722 is
+also refused with `488`.
 
 Outbound, the server supplies the same pair: calls carry it as ARI/PJSIP
 variables (or dialplan `PJSIP_HEADER(add,...)`), SMS as `X-SMS-*` headers.
@@ -410,6 +422,48 @@ exten => s,1,Set(PJSIP_HEADER(add,X-GSM-From)=${SIM_NUMBER})
 Allow enough time in `Dial()` for GSM setup — 60s is comfortable, 20s is not.
 Dialplan and ARI origination are interchangeable here; the gateway sees the
 same INVITE either way.
+
+## Addressing and identity
+
+- **Inbound number** — one field per SIM. The R-URI user and `X-GSM-To` are the
+  same strict `+E.164` value, so the server maps that number to an assistant.
+  The platform-published number is used when available; the field is the
+  fallback for carriers that publish none. A wrong configured value therefore
+  cannot misroute inbound calls while the SIM reports its real number. The field
+  is keyed by SIM slot. On a multi-SIM device the `X-GSM-To`/R-URI pair is what
+  selects routing, so no separate addressing settings are needed.
+- **From** — `<sip:SIP_USER@server-domain>` on INVITEs; REGISTER keeps
+  `From: <sip:username@publicIp>`. There is no custom From user or domain.
+- **P-Asserted-Identity** — not sent.
+- **Registration announcement** — sent to the SIP username.
+- **Ring timers** — fixed at 30 s for the first `180` and 70 s maximum ring
+  time.
+
+Outbound traffic is matched to a SIM by its source number: the platform-published
+MSISDN or the configured value, whichever the server or the device supplies. A
+source number that matches neither is refused (calls with `503`, SMS with `400`)
+rather than guessed.
+
+`X-GW-Id` in the registration announcement is a per-install UUID. It survives
+restarts but changes on uninstall/reinstall or an app-data clear; a server that
+keys gateways by id sees a reinstall as a new gateway.
+
+### Transport and media notes
+
+- Numbers are strict E.164: `+` followed by 8–15 digits.
+- SRTP is SDES-keyed and offered only over TLS. Over plain UDP the keys would be
+  readable on the path, so SRTP stays off there by design.
+- Registration uses `Contact: ...;expires=120` and refreshes every 60 s. The NAT
+  keepalive is a bare CRLF; OPTIONS is answered, not sent.
+- An initial INVITE without `m=audio` is refused with `488`; an in-dialog
+  re-INVITE without SDP is still answered with our offer.
+
+### Linux daemon differences
+
+The `linux/` daemon is not kept in parity with this change set:
+`linux/src/sipmsg.c` still sends `expires=3600`, `linux/src/rtp.c` implements
+PCMU, and the daemon uses a CRLF keepalive. Do not assume the APK and daemon
+have the same codec or registration behavior.
 
 ## Call status codes
 

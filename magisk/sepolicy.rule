@@ -1,1 +1,4 @@
+# Let the app reach Magisk's su socket. Domain differs by Android
+# version (priv_app / priv_app_36); unknown types are ignored.
+allow priv_app magisk unix_stream_socket { getopt connectto }
 allow priv_app_36 magisk unix_stream_socket { getopt connectto }

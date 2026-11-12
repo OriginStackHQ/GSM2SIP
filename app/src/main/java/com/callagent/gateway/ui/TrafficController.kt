@@ -103,7 +103,7 @@ class TrafficController(
                     duration.setTextColor(Color.parseColor("#34D399"))
                 }
                 else -> {
-                    duration.text = "—"
+                    duration.text = if (incoming) "Missed" else "Failed"
                     duration.setTextColor(Color.parseColor("#F87171"))
                 }
             }

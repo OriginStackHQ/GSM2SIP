@@ -102,6 +102,9 @@ class SipCall(
     // Custom headers must survive an authenticated INVITE retry.
     var extraHeaders: List<String> = emptyList()
 
+    /** Voice payload types we offered, for validating a 200 OK answer. */
+    var localOfferedPayloadTypes: Set<Int> = emptySet()
+
     // Original INVITE (for building responses)
     var originalInvite: SipMessage? = null
 
@@ -127,7 +130,7 @@ class SipCall(
                 msg.contactAddress?.let { remoteContactAddress = it }
                 msg.sdpRtpPort?.let { remoteRtpPort = it }
                 msg.sdpAddress?.let { remoteRtpAddress = it }
-                negotiatedPayloadType = msg.sdpPreferredPayloadType
+                val pt = msg.sdpPreferredPayloadType
 
                 // We offered SRTP; this is where we find out whether they took
                 // it.  If they did not, our key is dropped so the media path
@@ -154,6 +157,22 @@ class SipCall(
                     Log.i(TAG, "Duplicate 200 OK for call $callId (already answered), ACKed")
                     return true
                 }
+
+                // The answer must use a payload type we actually offered.  A
+                // server that answers with something else has agreed to a codec
+                // this call cannot encode or decode, so ACK the 200 (done
+                // above) and end the dialog rather than bridging silence.
+                if (pt == -1 || pt !in localOfferedPayloadTypes) {
+                    Log.w(
+                        TAG,
+                        "200 OK chose PT $pt, not in offered $localOfferedPayloadTypes — ending call"
+                    )
+                    sipClient.logListener?.invoke("Server answered with an unoffered codec — ending call")
+                    state = State.ANSWERED
+                    hangup()
+                    return true
+                }
+                negotiatedPayloadType = pt
 
                 Log.i(TAG, "SDP codec: pt=$negotiatedPayloadType codecs=${msg.sdpCodecs}")
                 state = State.ANSWERED
@@ -328,13 +347,13 @@ class SipCall(
      * Answer an in-dialog offer (re-INVITE or UPDATE) with 200 OK.
      *
      * The media session is not renegotiated: the answer repeats our existing
-     * port, codec offer and SRTP key, which is what a refresh expects.  If the
-     * peer moved its media, that is logged — symmetric RTP keeps sending to the
+     * port, codec and SRTP key, which is what a refresh expects.  If the peer
+     * moved its media, that is logged — symmetric RTP keeps sending to the
      * address the first packets came from, so configure the server not to
      * re-route media mid-call (Asterisk: direct_media=no).
      */
     private fun answerInDialogOffer(msg: SipMessage, what: String) {
-        val hasSdp = msg.body.contains("m=audio")
+        val hasSdp = msg.hasAudioOffer
         if (hasSdp) {
             val newAddr = msg.sdpAddress
             val newPort = msg.sdpRtpPort
@@ -345,24 +364,66 @@ class SipCall(
                 sipClient.logListener?.invoke("$what tried to move media — set direct_media=no on the server")
             }
         }
-        val ok = SipBuilder.ok200(
-            msg, sipClient.username, sipClient.publicIp, sipClient.localPort,
+
+        val address = remoteContactAddress ?: sipClient.serverAddress
+        if (hasSdp) {
+            // Keep the codec already negotiated for this call; a refresh may
+            // not switch it.  Refuse with 488 if the peer dropped it.
+            val pt = negotiatedPayloadType
+            if (pt !in msg.offeredAudioPayloadTypes) {
+                Log.w(TAG, "$what dropped PT $pt (offered ${msg.offeredAudioPayloadTypes}) — 488")
+                sipClient.sendResponse(
+                    // Not SipCall.reject(): that answers originalInvite, the
+                    // initial INVITE, and would reject the wrong transaction.
+                    SipBuilder.reject(msg, 488, "Not Acceptable Here", localTag),
+                    address
+                )
+                return
+            }
+            val ok = SipBuilder.ok200Answer(
+                msg, sipClient.username, sipClient.publicIp, sipClient.localPort,
+                localRtpPort = localRtpPort,
+                payloadType = pt,
+                includeDtmf = 101 in msg.offeredAudioPayloadTypes,
+                toTag = localTag,
+                srtp = if (srtpActive) localSrtpKeys else null,
+                srtpTag = srtpTag
+            )
+            if (ok == null) {
+                sipClient.sendResponse(
+                    SipBuilder.reject(msg, 488, "Not Acceptable Here", localTag),
+                    address
+                )
+                return
+            }
+            sipClient.sendResponse(ok, address)
+        } else {
             // A re-INVITE without SDP is a delayed offer: the 200 OK must
             // carry one.  An UPDATE without SDP is answered without.
-            localRtpPort = if ((hasSdp || msg.method == "INVITE") && localRtpPort > 0) localRtpPort else null,
-            toTag = localTag,
-            srtp = if (srtpActive) localSrtpKeys else null,
-            srtpTag = srtpTag
-        )
-        sipClient.sendResponse(ok, remoteContactAddress ?: sipClient.serverAddress)
+            val ok = SipBuilder.ok200(
+                msg, sipClient.username, sipClient.publicIp, sipClient.localPort,
+                localRtpPort = if (msg.method == "INVITE" && localRtpPort > 0) localRtpPort else null,
+                toTag = localTag,
+                srtp = if (srtpActive) localSrtpKeys else null,
+                srtpTag = srtpTag
+            )
+            sipClient.sendResponse(ok, address)
+        }
         Log.i(TAG, "Answered $what for call $callId (sdp=$hasSdp)")
     }
 
-    /** Accept an inbound INVITE: send 200 OK with SDP */
-    fun accept(localRtpPort: Int) {
+    /**
+     * Accept an inbound INVITE: send 200 OK with exactly one voice PT.
+     *
+     * Returns false when the offer cannot be answered; the caller must tear
+     * down the GSM leg and not start RTP.
+     */
+    fun accept(localRtpPort: Int): Boolean {
         this.localRtpPort = localRtpPort
-        val invite = originalInvite ?: return
+        val invite = originalInvite ?: return false
         val toTag = localTag
+        val pt = negotiatedPayloadType
+        val offered = invite.offeredAudioPayloadTypes
 
         // The INVITE's To header carries no local tag.  The tag we put into the
         // 200 OK becomes part of the dialog identifier and must also appear on
@@ -372,17 +433,31 @@ class SipCall(
             if (to.contains(";tag=")) to else "$to;tag=$toTag"
         }
 
-        val ok = SipBuilder.ok200(
+        if (pt !in offered) {
+            Log.w(TAG, "Cannot answer: negotiated PT $pt not offered ($offered)")
+            reject(488, "Not Acceptable Here")
+            return false
+        }
+        val ok = SipBuilder.ok200Answer(
             invite, sipClient.username, sipClient.publicIp, sipClient.localPort,
-            localRtpPort = localRtpPort, toTag = toTag,
+            localRtpPort = localRtpPort,
+            payloadType = pt,
+            includeDtmf = 101 in offered,
+            toTag = toTag,
             srtp = localSrtpKeys, srtpTag = srtpTag
         )
+        if (ok == null) {
+            Log.w(TAG, "Cannot build an answer for PT $pt")
+            reject(488, "Not Acceptable Here")
+            return false
+        }
 
         val address = invite.contactAddress ?: sipClient.serverAddress
         sipClient.sendResponse(ok, address)
 
         state = State.ANSWERED
-        Log.i(TAG, "Sent 200 OK for inbound call $callId (RTP port: $localRtpPort)")
+        Log.i(TAG, "Sent 200 OK for inbound call $callId (RTP port: $localRtpPort, pt=$pt)")
+        return true
     }
 
     /** Turn down an inbound INVITE we cannot bridge. */

@@ -1,6 +1,6 @@
 id=gsm2sip
 name=GSM2SIP
 version=v1.4.18
-versionCode=379
+versionCode=457
 author=callagent
 description=Installs the GSM2SIP app as a privileged system app and prepares its audio path: grants CAPTURE_AUDIO_OUTPUT and the telephony privileges, lifts Android's audio concurrency limits so calls can be captured and agent audio injected, allows the app in Magisk's superuser policy, and deploys a tinymix matching the device ABI. It also tries to hide PermissionController, which is a no-op on Android 15+ where that package lives in an APEX. Reboot to activate.

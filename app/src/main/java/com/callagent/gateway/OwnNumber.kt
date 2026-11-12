@@ -13,27 +13,19 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 
 /**
- * The gateway's own number as the *platform* reports it, for one subscription.
+ * The gateway's own number, for one subscription.
  *
  * Both directions of the bridge have to agree on this value: CallOrchestrator
  * uses it to address an inbound call, GatewayService uses it to address an
  * SMS.  A message and a call that disagree about which SIM they were on would
  * be mapped to two different assistants by the same server, so the lookup is
- * written once here rather than twice and left to drift — which is exactly how
- * the SMS path ended up not reading the SIM at all while the call path did.
+ * written once here rather than twice and left to drift.
  *
- * The chain is the same three steps everywhere, each only consulted when the
- * one before it had nothing:
- *
- *   1. what the platform publishes for this subscription  — this file
- *   2. `own_number_slot_<slot>`, the box the operator typed for that SIM
- *   3. the SIP account — loud, but at least it says so
- *
- * There is no step that borrows *another* SIM's box: a borrowed value would
- * be non-empty but belong to a different SIM, which routing cannot tell from
- * the right one.  Each subscription is answered only from its own platform
- * value or its own `own_number_slot_<slot>`; a miss stays empty and the
- * caller reports it.
+ * The platform-published number wins when there is one: it is what the network
+ * actually knows, and a configured value that is wrong but still valid would
+ * otherwise send inbound calls to the wrong assistant.  Many carriers publish
+ * no number at all, which is why the configured per-SIM value exists as the
+ * fallback.
  */
 object OwnNumber {
 
@@ -80,23 +72,19 @@ object OwnNumber {
     /**
      * The MSISDN the platform publishes for [subId], or null when it publishes
      * none — which most carriers do not, and which is why this can only ever
-     * be the first step.
+     * be one of the sources.
      *
      * On Android 13 and above [SubscriptionManager.getPhoneNumber] takes the
-     * subscription directly and there is nothing to get wrong.  Below that the
-     * only accessor is `TelephonyManager.line1Number`, and the handle returned
-     * by `getSystemService(TELEPHONY_SERVICE)` is bound to the **default**
+     * subscription directly.  Below that the only accessor is
+     * `TelephonyManager.line1Number`, and the handle returned by
+     * `getSystemService(TELEPHONY_SERVICE)` is bound to the **default**
      * subscription: it answers with SIM 1's number for a call that arrived on
-     * SIM 2.  That answer is non-empty, so the caller returns it there and the
-     * per-slot box is never reached — a confidently wrong DID with nothing in
-     * the log to say so, which is the precise failure the box exists to
-     * prevent.  [TelephonyManager.createForSubscriptionId] rebinds the handle
-     * to the subscription the call actually came in on; it is API 22 against
-     * this app's minSdk of 31, so it needs no version guard of its own.
+     * SIM 2.  [TelephonyManager.createForSubscriptionId] rebinds the handle to
+     * the subscription the call actually came in on.
      *
      * [subId] of [SubscriptionManager.INVALID_SUBSCRIPTION_ID] means the caller
-     * had no SIM to name, which keeps the pre-existing single-SIM behaviour of
-     * asking about the default subscription.
+     * had no SIM to name, which keeps the single-SIM behaviour of asking about
+     * the default subscription.
      */
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
@@ -107,9 +95,6 @@ object OwnNumber {
             else subMgr?.getPhoneNumber(SubscriptionManager.getDefaultSubscriptionId())
         } else {
             val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            // No getOrDefault(base): that handle is bound to the default
-            // subscription, so a fallback answers with SIM 1's number for a SIM
-            // 2 call. A miss stays a miss, so the per-slot box is consulted.
             val scoped = if (isValidSubscription(subId)) {
                 runCatching { base.createForSubscriptionId(subId) }
                     .onFailure { Log.w(TAG, "createForSubscriptionId($subId) failed; no SIM number: ${it.message}") }
@@ -150,8 +135,6 @@ object OwnNumber {
 
         val iso = runCatching {
             val base = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            // Same rule as fromSim: a failed rebind must not read
-            // another SIM's country and build a valid-looking number from it.
             val scoped = if (isValidSubscription(subId)) {
                 runCatching { base.createForSubscriptionId(subId) }
                     .onFailure { Log.w(TAG, "createForSubscriptionId($subId) failed; no country ISO: ${it.message}") }
@@ -167,18 +150,82 @@ object OwnNumber {
             ?.takeIf(::isE164)
     }
 
-    /** Resolve a source number to one active subscription. */
-    @SuppressLint("MissingPermission")
-    fun subscriptionIdForNumber(context: Context, number: String): Int? {
-        val matches = subscriptions(context).filter { info ->
-            val own = numberForSubscriptionId(context, info.subscriptionId)
-            val target = normalizeNumber(context, number, info.subscriptionId)
-            own != null && target != null && numbersMatch(
-                target = target,
-                candidate = normalizeNumber(context, own, info.subscriptionId)
-            )
-        }
+    /** The configured per-SIM number, normalized, or null when unset/invalid. */
+    private fun configuredNumber(context: Context, subId: Int): String? {
+        if (!isValidSubscription(subId)) return null
+        val slot = simSlotForSubscription(context, subId) ?: return null
+        return prefs(context).getString("own_number_slot_$slot", "")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { toE164(context, it, subId) }
+            ?.takeIf(::isE164)
+    }
 
+    /**
+     * The number this gateway addresses traffic with: the platform value first,
+     * then the configured per-SIM value.
+     *
+     * The platform value is authoritative when present.  A configured value
+     * that is wrong but still valid would otherwise misroute inbound calls,
+     * so the setting is a fallback for carriers that publish no number.
+     *
+     * The configured value is keyed by slot, matching the settings field.
+     */
+    @SuppressLint("MissingPermission")
+    fun sourceNumberForSubscriptionId(context: Context, subId: Int): String? {
+        if (!isValidSubscription(subId)) return null
+        return fromSim(context, subId)?.takeIf(::isE164) ?: configuredNumber(context, subId)
+    }
+
+    /**
+     * Every number a SIM can be recognised by: the platform value and the
+     * configured value.
+     *
+     * Addressing uses the platform number when it exists and falls back to the
+     * configured value otherwise.  Matching still has to accept either: an
+     * operator may address the SIM by the configured number, while outbound
+     * headers and Telecom account addresses carry the platform number.
+     */
+    private fun matchCandidates(context: Context, subId: Int): List<String> =
+        listOfNotNull(
+            fromSim(context, subId)?.takeIf(::isE164),
+            configuredNumber(context, subId),
+        ).distinct()
+
+    /** Match a SIM by any number it is known by (configured or platform). */
+    fun subscriptionIdForNumber(context: Context, number: String): Int? =
+        matchSubscriptions(context, number) { subId -> matchCandidates(context, subId) }
+
+    /**
+     * Resolve an unknown subId only when exactly one SIM is active.
+     *
+     * A multi-SIM gateway must never guess: naming the wrong SIM routes a call
+     * or message to the wrong assistant.
+     */
+    fun resolveSubscriptionId(context: Context, subId: Int): Int {
+        if (isValidSubscription(subId)) return subId
+        val active = activeSubscriptions(context)
+        return if (active.size == 1) active.single().subscriptionId
+        else SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    }
+
+    /**
+     * Normalize the target per candidate subscription, exactly as the old
+     * lookup did: that is what lets a national-formatted `X-GSM-From` resolve
+     * on dual-SIM, using each SIM's own country.
+     */
+    private fun matchSubscriptions(
+        context: Context,
+        number: String,
+        candidates: (Int) -> List<String>,
+    ): Int? {
+        val matches = activeSubscriptions(context).filter { info ->
+            val subId = info.subscriptionId
+            val target = toE164(context, number, subId) ?: return@filter false
+            candidates(subId).any { candidate ->
+                val normalized = toE164(context, candidate, subId) ?: candidate
+                numbersMatch(target, normalized)
+            }
+        }
         return when (matches.size) {
             1 -> matches.single().subscriptionId
             0 -> {
@@ -194,6 +241,10 @@ object OwnNumber {
 
     private fun numbersMatch(target: String, candidate: String?): Boolean {
         if (candidate == null) return false
+        // Two E.164 numbers match only exactly.  The suffix rules below exist
+        // for national-formatted input, and applying them to E.164 would let
+        // +4915112345678 and +491511234567 match.
+        if (isE164(target) && isE164(candidate)) return target == candidate
         val targetDigits = target.filter(Char::isDigit)
         val candidateDigits = candidate.filter(Char::isDigit)
         val targetNational = targetDigits.trimStart('0').ifEmpty { targetDigits }
@@ -206,29 +257,8 @@ object OwnNumber {
                 candidateDigits.endsWith(targetNational))
     }
 
-    private fun normalizeNumber(
-        context: Context,
-        number: String,
-        subId: Int?
-    ): String? = toE164(context, number, subId ?: SubscriptionManager.INVALID_SUBSCRIPTION_ID)
-
-    /** Return the configured/platform number for one subscription. */
-    fun numberForSubscriptionId(context: Context, subId: Int): String? {
-        val subscription = if (isValidSubscription(subId)) {
-            subId
-        } else {
-            SubscriptionManager.getDefaultSubscriptionId()
-        }
-        val slot = simSlotForSubscription(context, subscription)
-        return fromSim(context, subscription)
-            ?: slot?.let {
-                context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
-                    .getString("own_number_slot_$it", "")
-                    ?.let { configured -> toE164(context, configured, subscription) }
-            }
-    }
-
-    private fun subscriptions(context: Context) = activeSubscriptions(context)
+    private fun prefs(context: Context) =
+        context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
 
     /**
      * Whether [subId] identifies a subscription that can be queried.

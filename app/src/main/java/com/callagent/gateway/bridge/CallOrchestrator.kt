@@ -155,37 +155,6 @@ class CallOrchestrator(
         timers.shutdownNow()
     }
 
-    /**
-     * The number this gateway answers on, sent as the SIP destination.
-     *
-     * The server maps an incoming number to an assistant the same way it does
-     * a Fritz!Box DID, so it needs the MSISDN of our SIM here.  Addressing our
-     * own SIP account instead makes the platform see account N calling account
-     * N, match it as a local peer and ring us straight back — the INVITE comes
-     * back, the orchestrator rejects it as busy, and the GSM leg is never
-     * answered.
-     *
-     * [subId] identifies the SIM that actually took the call.  On a dual-SIM
-     * gateway the default subscription is the wrong question to ask: a call
-     * arriving on the non-default SIM would be announced as the default SIM's
-     * DID and routed to the wrong assistant.  Resolved through the same
-     * [OwnNumber.numberForSubscriptionId] the SMS path uses, so a message and a
-     * call from one SIM can never name two different DIDs.
-     *
-     * Asks the platform first; many carriers do not publish the number on the
-     * SIM, in which case the configured value is used.
-     */
-    private fun inboundSipDestination(subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID): String {
-        val ownNumber = OwnNumber.numberForSubscriptionId(context, subId)
-        if (!ownNumber.isNullOrBlank()) {
-            val intl = toInternational(ownNumber, subId)
-            Log.i(TAG, "Own number for subscription $subId: $ownNumber → $intl")
-            return intl
-        }
-        Log.w(TAG, "No own number known for subscription $subId — rejecting call")
-        return ""
-    }
-
     private fun isValidSubscription(subId: Int): Boolean =
         OwnNumber.isValidSubscription(subId)
 
@@ -282,7 +251,7 @@ class CallOrchestrator(
             active.firstOrNull { info ->
                 val subId = info.subscriptionId
                 listOfNotNull(
-                    OwnNumber.numberForSubscriptionId(context, subId)
+                    OwnNumber.sourceNumberForSubscriptionId(context, subId)
                 ).any { configured ->
                     val own = digitsOf(configured)
                     own == addressed || own.endsWith(addressed) || addressed.endsWith(own)
@@ -516,7 +485,14 @@ class CallOrchestrator(
                     activeSipCall?.let { sipCall ->
                         val rtpPort = allocateRtpPort()
                         sipCall.listener = this
-                        sipCall.accept(rtpPort)
+                        // A failed answer (no usable codec) rejects the INVITE
+                        // with 488; the GSM leg must go too, and no RTP may
+                        // start for a call that was never answered.
+                        if (!sipCall.accept(rtpPort)) {
+                            Log.w(TAG, "SIP answer rejected — tearing down GSM leg")
+                            tearDown("SIP answer rejected")
+                            return@Thread
+                        }
 
                         val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
                         val port = sipCall.remoteRtpPort
@@ -652,14 +628,17 @@ class CallOrchestrator(
         val rawCallerNumber = gsmCall.details?.handle?.schemeSpecificPart.orEmpty()
         // The SIM that is actually ringing decides both the caller's country
         // for E.164 normalization and the DID announced to Asterisk.
-        val subId = subscriptionIdFor(gsmCall)
+        val subId = OwnNumber.resolveSubscriptionId(context, subscriptionIdFor(gsmCall))
         val callerNumber = toInternational(rawCallerNumber, subId)
-        val toNumber = OwnNumber.numberForSubscriptionId(context, subId).orEmpty()
-        if (!OwnNumber.isValidSubscription(subId) || callerNumber.isBlank() || toNumber.isBlank()) {
+        val toNumber = OwnNumber.sourceNumberForSubscriptionId(context, subId).orEmpty()
+        if (!OwnNumber.isValidSubscription(subId) ||
+            callerNumber.isBlank() ||
+            !OwnNumber.isE164(toNumber)
+        ) {
             Log.w(
                 TAG,
                 "Inbound routing data incomplete: sub=$subId valid=${OwnNumber.isValidSubscription(subId)} " +
-                    "callerPresent=${callerNumber.isNotBlank()} ownNumberPresent=${toNumber.isNotBlank()}"
+                    "callerPresent=${callerNumber.isNotBlank()} ownNumber=$toNumber"
             )
             GsmCallManager.rejectCall(gsmCall)
             tearDown("Inbound routing data unavailable")
@@ -671,14 +650,10 @@ class CallOrchestrator(
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
 
         val rtpPort = allocateRtpPort()
-        val destination = inboundSipDestination(subId)
-        if (destination.isBlank()) {
-            GsmCallManager.rejectCall(gsmCall)
-            tearDown("Inbound SIM number is unavailable")
-            return
-        }
+        // The R-URI user and X-GSM-To are the same strict E.164 value; the
+        // server maps that number to an assistant.
         val sipCall = sipClient.makeCall(
-            targetExtension = destination,
+            targetExtension = toNumber,
             localRtpPort = rtpPort,
             extraHeaders = listOf(
                 "X-GSM-From: $callerNumber",
@@ -1015,8 +990,6 @@ class CallOrchestrator(
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
         /** Safety net once the server reports ringing (its own dial timeout normally ends it first). */
         private const val SIP_RING_MAX_MS = 70_000L
-        /** If bridge is non-IDLE for this long, consider it stale */
-        private const val STALE_STATE_TIMEOUT_MS = 60_000L
 
         private const val RTP_PORT_MIN = 30000
         private const val RTP_PORT_MAX = 40000

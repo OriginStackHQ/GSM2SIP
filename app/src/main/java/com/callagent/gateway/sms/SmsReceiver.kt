@@ -39,13 +39,16 @@ class SmsReceiver : BroadcastReceiver() {
 
         // Which SIM took it.  Two extra names are in circulation and OEMs
         // disagree about which they set, so try both before giving up.
-        val subId = intent.getIntExtra(
+        val rawSubId = intent.getIntExtra(
             SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX,
             intent.getIntExtra("subscription", SubscriptionManager.INVALID_SUBSCRIPTION_ID)
         )
+        // Resolve only when there is exactly one SIM to resolve to; a
+        // multi-SIM gateway must never guess which SIM a message arrived on.
+        val subId = OwnNumber.resolveSubscriptionId(context, rawSubId)
         val sender = OwnNumber.toE164(context, rawSender, subId)
         val (slot, carrier, _) = describeSim(context, subId)
-        val ownNumber = OwnNumber.numberForSubscriptionId(context, subId).orEmpty()
+        val ownNumber = OwnNumber.sourceNumberForSubscriptionId(context, subId).orEmpty()
         if (sender == null || !OwnNumber.isE164(ownNumber)) {
             Log.w(
                 TAG,

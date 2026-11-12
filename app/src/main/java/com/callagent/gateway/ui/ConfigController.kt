@@ -45,15 +45,11 @@ class ConfigController(
     fun ownNumberForDisplay(
         subId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID,
     ): String {
-        val named = OwnNumber.isValidSubscription(subId)
-        val prefs = activity.getSharedPreferences("gateway", Context.MODE_PRIVATE)
-        val forSub = if (named) subId else SubscriptionManager.getDefaultSubscriptionId()
-        val slot = runCatching {
-            activity.getSystemService(SubscriptionManager::class.java)
-                ?.getActiveSubscriptionInfo(forSub)?.simSlotIndex
-        }.getOrNull()
-        val fromBox = slot?.let { prefs.getString(ownNumberKey(it), "") }?.trim().orEmpty()
-        return OwnNumber.fromSim(activity, forSub) ?: fromBox
+        // Resolve first: MainActivity passes INVALID and TrafficController can
+        // pass -1, and a multi-SIM gateway must not silently pick a SIM.
+        val resolved = OwnNumber.resolveSubscriptionId(activity, subId)
+        if (!OwnNumber.isValidSubscription(resolved)) return "—"
+        return OwnNumber.sourceNumberForSubscriptionId(activity, resolved) ?: "—"
     }
 
     @SuppressLint("MissingPermission")
@@ -73,6 +69,11 @@ class ConfigController(
                 ?: info.iccId?.takeIf { it.isNotBlank() }
                     ?.let { "ICCID …${it.takeLast(6)}" }
                 ?: ""
+            // The number the SIM itself reports, shown next to the IMEI so an
+            // operator can compare it with what they typed above.
+            val physicalNumber = OwnNumber.fromSim(activity, subId)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { "Number $it" }
             SimInfo(
                 slot = slot,
                 subId = subId,
@@ -81,6 +82,7 @@ class ConfigController(
                     "SIM ${slot + 1}",
                     carrier.ifEmpty { null },
                     ident.ifEmpty { null },
+                    physicalNumber,
                 ).joinToString("  ·  "),
             )
         }.sortedBy { it.slot }

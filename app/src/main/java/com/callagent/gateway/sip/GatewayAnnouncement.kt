@@ -20,6 +20,9 @@ object GatewayAnnouncement {
 
     private const val TAG = "GatewayAnnouncement"
 
+    /** SharedPreferences key holding the per-install UUID. */
+    private const val KEY_INSTALL_ID = "install_id"
+
     /** Marks the message as a lifecycle announcement, not an SMS. */
     const val HEADER_EVENT = "X-GW-Event"
 
@@ -72,8 +75,9 @@ object GatewayAnnouncement {
         }.toString()
 
         // To our own AOR; the dialplan exten comes from the Request-URI user.
+        val targetUri = "sip:$username@${sip.serverDomain}"
         val code = sip.sendSipMessage(
-            targetUri = "sip:$username@${sip.serverDomain}",
+            targetUri = targetUri,
             fromUser = username,
             body = body,
             extraHeaders = headers,
@@ -91,17 +95,33 @@ object GatewayAnnouncement {
         }
     }
 
-    /** Stable handset id for logs/routing, not a credential. */
+    /** Stable per-install id for logs/routing, not a credential. */
     private fun describe(context: Context): Fields {
         val device = (Build.DEVICE ?: "").ifBlank { Build.MODEL ?: "unknown" }
         return Fields(
-            id = "$device-${BuildConfig.VERSION_NAME}",
+            id = installId(context),
             manufacturer = Build.MANUFACTURER ?: "",
             model = Build.MODEL ?: "",
             device = device,
             // Audio path: digital vs speaker/mic fallback.
             profile = GsmCallManager.profile.name
         )
+    }
+
+    /**
+     * The per-install id announced as X-GW-Id.
+     *
+     * Generated once and persisted, so it survives restarts but changes on
+     * uninstall/reinstall or an app-data clear.  It is deliberately not
+     * derived from the build version: a server that keys gateways by id would
+     * otherwise see every upgrade as a new gateway.
+     */
+    private fun installId(context: Context): String {
+        val prefs = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+        prefs.getString(KEY_INSTALL_ID, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        val id = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_INSTALL_ID, id).apply()
+        return id
     }
 
     private data class Fields(
@@ -118,14 +138,9 @@ object GatewayAnnouncement {
         for (info in OwnNumber.activeSubscriptions(context)) {
             val subId = info.subscriptionId
             if (!OwnNumber.isValidSubscription(subId)) continue
-            val raw = OwnNumber.numberForSubscriptionId(context, subId)
-            if (raw.isNullOrBlank()) {
-                Log.w(TAG, "SIM slot ${info.simSlotIndex} has no resolvable number — omitted")
-                continue
-            }
-            val e164 = OwnNumber.toE164(context, raw, subId)
+            val e164 = OwnNumber.sourceNumberForSubscriptionId(context, subId)
             if (e164.isNullOrBlank() || !OwnNumber.isE164(e164)) {
-                Log.w(TAG, "SIM slot ${info.simSlotIndex} number '$raw' is not +E.164 — omitted")
+                Log.w(TAG, "SIM slot ${info.simSlotIndex} has no resolvable number — omitted")
                 continue
             }
             if (e164 !in out) out += e164
