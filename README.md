@@ -432,7 +432,8 @@ same INVITE either way.
   cannot misroute inbound calls while the SIM reports its real number. The field
   is keyed by SIM slot. On a multi-SIM device the `X-GSM-To`/R-URI pair is what
   selects routing, so no separate addressing settings are needed.
-- **From** — `<sip:SIP_USER@server-domain>` on INVITEs; REGISTER keeps
+- **From** — `<sip:SIP_USER@server-domain>` on INVITEs and outbound MESSAGEs
+  (SMS and delivery reports); REGISTER keeps
   `From: <sip:username@publicIp>`. There is no custom From user or domain.
 - **P-Asserted-Identity** — not sent.
 - **Registration announcement** — sent to the SIP username.
@@ -536,7 +537,7 @@ One MESSAGE per message, already reassembled from its parts:
 
 ```
 MESSAGE sip:1001@example.com SIP/2.0
-From: <sip:+4917098765432@example.com>;tag=gw123456789
+From: <sip:1001@example.com>;tag=gw123456789
 To: <sip:+4915112345678@example.com>
 X-SMS-Id: 550e8400-e29b-41d4-a716-446655440000
 X-SMS-From: +4917098765432
@@ -646,7 +647,7 @@ mistake if assumed otherwise:
 
 - Out-of-call MESSAGEs are enabled per **endpoint** with `message_context`.
   That is the only switch; nothing is needed in a general section, and inbound
-  MESSAGE is authenticated by the registration the calls already use.
+  MESSAGE uses the same account the calls register with.
 - The channel's **exten is the Request-URI's user part**.
   `rx_data_to_ast_msg` in res_pjsip_messaging.c copies it out of the R-URI, so
   a MESSAGE addressed to `sip:1001@example.com` lands on exten `1001` in the
@@ -659,14 +660,13 @@ mistake if assumed otherwise:
 type=endpoint
 ...
 message_context=sms-from-gsm-1001
+identify_by=username
 ```
 
-The gateway is registered, but that alone does not route inbound MESSAGEs:
-res_pjsip still matches the endpoint by source address, so the gateway's
-contact address needs an `identify` match. Without one, inbound MESSAGE and
-INVITE are rejected with `No matching endpoint found` even though
-registration succeeds. MESSAGE is accepted on the same registration the
-calls use.
+The `From` user must equal the endpoint id: a request whose `From` user is not
+a provisioned endpoint is rejected with `No matching endpoint found` even
+though registration succeeds. `identify_by=username,ip` accepts either during
+a mixed-version rollout.
 
 #### Receiving: SMS, reports and gateway announcements
 

@@ -702,7 +702,7 @@ class GatewayService : Service() {
         if (sms.attempts > 0) headers += "X-SMS-Attempt: ${sms.attempts + 1}"
         return sip.sendSipMessage(
             targetUri = targetUri,
-            fromUser = sms.from,
+            fromUser = cfgUser,
             body = sms.text,
             extraHeaders = headers
         )
@@ -1057,7 +1057,7 @@ class GatewayService : Service() {
         // an X-SMS-* header too, so PJSIP_HEADER(read,...) alone is enough.
         val code = sip.sendSipMessage(
             targetUri = "sip:$cfgUser@$cfgServer",
-            fromUser = source,
+            fromUser = cfgUser,
             body = body,
             extraHeaders = headers,
             contentType = "text/plain;charset=UTF-8"

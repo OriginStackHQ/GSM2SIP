@@ -172,31 +172,34 @@ function Build-Apk {
 
 # ── Build Magisk module ─────────────────────────────
 
-function Build-TinymixArch {
+function Build-ToolArch {
     param(
+        [string]$Name,
         [string]$GoArch,
         [string]$OutPath
     )
-    $tinymixSrc = Join-Path $ScriptDir "tools\tinymix"
+    $src = Join-Path $ScriptDir "tools\$Name"
 
-    # Check if pre-built binary of the right architecture exists
+    # A pre-built binary of the right architecture is good enough
     if (Test-Path $OutPath) {
         $bytes = [System.IO.File]::ReadAllBytes($OutPath)
-        # ELF header: byte 4 = class (1=32-bit, 2=64-bit)
-        if ($bytes.Length -gt 4 -and $bytes[0] -eq 0x7f -and $bytes[1] -eq 0x45) {
+        # ELF header: byte 4 = class (1=32-bit, 2=64-bit) and e_machine at
+        # offset 18 (0x28 = ARM, 0xB7 = AArch64), little-endian.
+        if ($bytes.Length -gt 19 -and $bytes[0] -eq 0x7f -and $bytes[1] -eq 0x45) {
             $elfClass = $bytes[4]
-            if (($GoArch -eq "arm64" -and $elfClass -eq 2) -or
-                ($GoArch -eq "arm" -and $elfClass -eq 1)) {
-                Write-Host "Using existing tinymix: $OutPath"
-                return
+            $machine = $bytes[18]
+            if (($GoArch -eq "arm64" -and $elfClass -eq 2 -and $machine -eq 0xb7) -or
+                ($GoArch -eq "arm" -and $elfClass -eq 1 -and $machine -eq 0x28)) {
+                Write-Host "Using existing ${Name}: $OutPath"
+                return $true
             }
         }
     }
 
     $go = Get-Command go -ErrorAction SilentlyContinue
-    if ($go -and (Test-Path (Join-Path $tinymixSrc "main.go"))) {
-        Write-Host "Building tinymix for $GoArch..."
-        Push-Location $tinymixSrc
+    if ($go -and (Test-Path (Join-Path $src "main.go"))) {
+        Write-Host "Building $Name for $GoArch..."
+        Push-Location $src
         try {
             $env:GOOS = "linux"
             $env:GOARCH = $GoArch
@@ -204,8 +207,8 @@ function Build-TinymixArch {
             $env:CGO_ENABLED = "0"
             & go build -ldflags="-s -w" -o $OutPath .
             if (Test-Path $OutPath) {
-                Write-Host "tinymix built: $OutPath"
-                return
+                Write-Host "$Name built: $OutPath"
+                return $true
             }
         } finally {
             Pop-Location
@@ -216,9 +219,10 @@ function Build-TinymixArch {
         }
     }
 
-    Write-Host "WARNING: could not build tinymix for $GoArch - mixer controls will"
-    Write-Host "         not work on $GoArch devices.  Install Go, or drop a"
-    Write-Host "         pre-built binary at: $OutPath"
+    Write-Host "WARNING: could not build $Name for $GoArch - it will be missing on"
+    Write-Host "         $GoArch devices.  Install Go, or drop a pre-built"
+    Write-Host "         binary at: $OutPath"
+    return $false
 }
 
 function Build-Tinymix {
@@ -226,8 +230,34 @@ function Build-Tinymix {
     Write-Host '=== Building tinymix (static, one per ABI) ==='
     Write-Host ""
 
-    Build-TinymixArch -GoArch "arm64" -OutPath (Join-Path $ScriptDir "magisk\tinymix")
-    Build-TinymixArch -GoArch "arm" -OutPath (Join-Path $ScriptDir "magisk\tinymix32")
+    Build-ToolArch -Name "tinymix" -GoArch "arm64" -OutPath (Join-Path $ScriptDir "magisk\tinymix") | Out-Null
+    Build-ToolArch -Name "tinymix" -GoArch "arm" -OutPath (Join-Path $ScriptDir "magisk\tinymix32") | Out-Null
+}
+
+function Build-Tinypcm {
+    Write-Host ""
+    Write-Host '=== Building tinypcm (static, one per ABI) ==='
+    Write-Host ""
+
+    Build-ToolArch -Name "tinypcm" -GoArch "arm64" -OutPath (Join-Path $ScriptDir "magisk\tinypcm") | Out-Null
+    Build-ToolArch -Name "tinypcm" -GoArch "arm" -OutPath (Join-Path $ScriptDir "magisk\tinypcm32") | Out-Null
+}
+
+# abox_pos.ko needs the S10e kernel tree to build (tools/abox-pos/build.sh), so
+# a prebuilt copy lives in magisk/ like tinycap; a fresh build replaces it.
+function Copy-AboxPos {
+    $ko = Join-Path $ScriptDir "tools\abox-pos\abox_pos.ko"
+    $dest = Join-Path $ScriptDir "magisk\abox_pos.ko"
+
+    if (Test-Path $ko) {
+        Copy-Item $ko $dest -Force
+        Write-Host "Included abox_pos.ko from tools/abox-pos"
+    } elseif (Test-Path $dest) {
+        Write-Host "Using prebuilt magisk/abox_pos.ko"
+    } else {
+        Write-Host "WARNING: no abox_pos.ko - the S10e (Exynos 9820) will have no call"
+        Write-Host "         audio path.  Build it with tools/abox-pos/build.sh."
+    }
 }
 
 function Stamp-ModuleProp {
@@ -268,6 +298,8 @@ function Build-Magisk {
     Write-Host ""
 
     Build-Tinymix
+    Build-Tinypcm
+    Copy-AboxPos
 
     # Copy the APK into the Magisk module as a system priv-app
     $privAppDir = Join-Path $ScriptDir "magisk\system\priv-app\GSM2SIP"
